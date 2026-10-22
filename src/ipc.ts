@@ -5,7 +5,6 @@ import type {
   ChatMsg,
   CursorPos,
   ModelEntry,
-  Rect,
   WindowBounds,
 } from "./types";
 
@@ -17,14 +16,14 @@ export const api = {
   modelBaseUrl: () => invoke<string>("model_base_url"),
   cursorPos: () => invoke<CursorPos>("cursor_pos"),
   setPassthrough: (ignore: boolean) => invoke<void>("set_passthrough", { ignore }),
-  setClickRegion: (rects: Rect[]) =>
-    invoke<void>("set_click_region", {
-      rects: rects.map((r) => [r.x, r.y, r.w, r.h]),
-    }),
   windowBounds: () => invoke<WindowBounds>("window_bounds"),
   setWindowPosition: (x: number, y: number) => invoke<void>("set_window_position", { x, y }),
   setAlwaysOnTop: (on: boolean) => invoke<void>("set_always_on_top", { on }),
   toggleWindow: () => invoke<void>("toggle_window"),
+  /** Shows or hides the character, the app keeps running in the tray. */
+  setWindowVisible: (visible: boolean) => invoke<void>("set_window_visible", { visible }),
+  windowVisible: () => invoke<boolean>("window_visible"),
+  quitApp: () => invoke<void>("quit_app"),
   openPath: (path: string) => invoke<void>("open_path", { path }),
   detectBackend: () => invoke<BackendInfo>("detect_backend"),
   chat: (messages: ChatMsg[]) => invoke<void>("chat", { messages }),

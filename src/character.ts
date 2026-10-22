@@ -1,7 +1,6 @@
-import { Application, RenderTexture } from "pixi.js";
+import { Application, MIPMAP_MODES, RenderTexture, SCALE_MODES } from "pixi.js";
 import { Live2DModel } from "pixi-live2d-display/cubism4";
 import { log } from "./logger";
-import type { Rect } from "./types";
 
 /** How often the alpha mask is refreshed (ms). */
 const MASK_INTERVAL = 95;
@@ -32,6 +31,8 @@ export class Character {
   private maskHeight = 0;
   private maskScale = 1;
   private lastMaskAt = 0;
+  /** Top-center of the visible silhouette in css pixels, updated with the mask. */
+  private head = { x: 0, y: 0, valid: false };
   private mouth = 0;
   private mouthTarget = 0;
   private events: CharacterEvents = {};
@@ -41,9 +42,6 @@ export class Character {
 
   /** Total number of pixels in the mask. */
   maskPixels = 0;
-
-  /** Bumped every time the alpha mask was refreshed. */
-  maskVersion = 0;
 
   private maskReported = false;
 
@@ -65,11 +63,41 @@ export class Character {
       this.events.onTap?.(areas);
     });
 
+    this.optimizeTextures(model);
+
     log(
       `model ready: ${this.naturalWidth}x${this.naturalHeight} scale=${model.scale.x.toFixed(3)} pos=${model.position.x.toFixed(1)},${model.position.y.toFixed(1)} textures=${model.textures.length} renderer=${this.app.renderer.type} viewport=${this.viewport().width}x${this.viewport().height}`,
     );
 
     return model;
+  }
+
+  /**
+   * The artwork is authored at 2048x2048 but is usually painted much smaller
+   * on screen. Mipmaps plus anisotropic filtering keep the downscaled
+   * texture smooth while the model moves instead of shimmering/pixelating.
+   */
+  private optimizeTextures(model: Live2DModel): void {
+    const gl = (this.app.renderer as unknown as { gl?: WebGLRenderingContext }).gl;
+    let maxAnisotropy = 1;
+    if (gl) {
+      const ext = gl.getExtension("EXT_texture_filter_anisotropic");
+      if (ext) {
+        maxAnisotropy = gl.getParameter(ext.MAX_TEXTURE_MAX_ANISOTROPY_EXT) as number;
+      }
+    }
+    const anisotropicLevel = Math.max(1, Math.min(8, maxAnisotropy));
+
+    for (const texture of model.textures) {
+      const base = texture.baseTexture;
+      base.scaleMode = SCALE_MODES.LINEAR;
+      base.mipmap = MIPMAP_MODES.ON;
+      base.anisotropicLevel = anisotropicLevel;
+    }
+
+    log(
+      `textures: ${model.textures.length}, linear filter, mipmaps on, anisotropy ${anisotropicLevel}x`,
+    );
   }
 
   /** Fits the character into the window, anchored to the bottom centre. */
@@ -144,7 +172,13 @@ export class Character {
     this.mouthTarget = Math.max(0, Math.min(1, amount));
   }
 
-  /** True when the given stage coordinate is covered by the character. */
+  /**
+   * True when the given stage coordinate is covered by the character.
+   *
+   * This is the hit-test used for click-through. The window is never clipped
+   * to this mask, so the rendered edge stays anti-aliased; only the mouse
+   * handling is decided from it.
+   */
   isOpaqueAt(x: number, y: number): boolean {
     const data = this.maskData;
     if (!data) return false;
@@ -152,70 +186,22 @@ export class Character {
     const py = Math.floor(y * this.maskScale);
     if (px < 0 || py < 0 || px >= this.maskWidth || py >= this.maskHeight) return false;
     const index = (py * this.maskWidth + px) * 4;
-    return data[index + 3] > 10;
+    return data[index + 3] > MASK_ALPHA_THRESHOLD;
   }
 
   /**
-   * The silhouette of the character as a list of rectangles in css pixels.
-   *
-   * They are used to build the window region of the desktop window: only
-   * inside those rectangles the window reacts to the mouse, everywhere else
-   * the click goes through to whatever is behind it.
+   * Where the speech bubble should sit: the top-center of her visible head in
+   * css pixels. Falls back to the sprite bounds until the first mask is ready.
    */
-  regionRects(alphaThreshold = MASK_ALPHA_THRESHOLD): Rect[] {
-    const data = this.maskData;
-    if (!data || !this.maskWidth || !this.maskHeight) return [];
-
-    // css pixels per mask pixel
-    const perPixel = 1 / this.maskScale;
-
-    // Collect the horizontal runs of every row and merge the runs that stay
-    // the same over several rows, that keeps the number of rectangles low.
-    type Run = { x0: number; x1: number; y0: number; y1: number };
-    let active: Run[] = [];
-    const finished: Run[] = [];
-
-    for (let y = 0; y < this.maskHeight; y++) {
-      const row: Run[] = [];
-      const offset = y * this.maskWidth * 4;
-      let start = -1;
-
-      for (let x = 0; x < this.maskWidth; x++) {
-        const opaque = data[offset + x * 4 + 3] > alphaThreshold;
-        if (opaque) {
-          if (start < 0) start = x;
-        } else if (start >= 0) {
-          row.push({ x0: start, x1: x, y0: y, y1: y });
-          start = -1;
-        }
-      }
-      if (start >= 0) row.push({ x0: start, x1: this.maskWidth, y0: y, y1: y });
-
-      const next: Run[] = [];
-      for (const run of row) {
-        const previous = active.find((a) => a.x0 === run.x0 && a.x1 === run.x1);
-        if (previous) {
-          previous.y1 = run.y1;
-          next.push(previous);
-        } else {
-          next.push(run);
-        }
-      }
-      for (const run of active) {
-        if (!next.includes(run)) finished.push(run);
-      }
-      active = next;
+  headAnchor(): { x: number; y: number } {
+    if (this.head.valid) return { x: this.head.x, y: this.head.y };
+    const model = this.model;
+    if (model) {
+      const bounds = model.getBounds();
+      return { x: bounds.x + bounds.width / 2, y: bounds.y };
     }
-    finished.push(...active);
-
-    // The rectangles are enlarged slightly so that soft edges and
-    // hair strands still belong to the character.
-    return finished.map((run) => ({
-      x: Math.floor(run.x0 * perPixel) - 1,
-      y: Math.floor(run.y0 * perPixel) - 1,
-      w: Math.ceil((run.x1 - run.x0) * perPixel) + 2,
-      h: Math.ceil((run.y1 - run.y0 + 1) * perPixel) + 2,
-    }));
+    const { width, height } = this.viewport();
+    return { x: width / 2, y: height * 0.45 };
   }
 
   /** Called from the pixi ticker. */
@@ -285,16 +271,58 @@ export class Character {
       this.maskScale = scale;
 
       let opaque = 0;
-      for (let i = 3; i < this.maskData.length; i += 4) {
-        if (this.maskData[i] > 10) opaque++;
+      let minX = width;
+      let minY = height;
+      let maxX = -1;
+      let maxY = -1;
+      for (let y = 0; y < height; y++) {
+        const row = y * width * 4;
+        for (let x = 0; x < width; x++) {
+          if (this.maskData[row + x * 4 + 3] > MASK_ALPHA_THRESHOLD) {
+            opaque++;
+            if (x < minX) minX = x;
+            if (x > maxX) maxX = x;
+            if (y < minY) minY = y;
+            if (y > maxY) maxY = y;
+          }
+        }
       }
       this.opaquePixels = opaque;
       this.maskPixels = width * height;
-      this.maskVersion++;
+
+      if (maxX >= minX && maxY >= minY) {
+        // Her head is the top slice of the silhouette. The average x of the
+        // opaque pixels in that slice keeps the bubble over the head instead
+        // of the bounding box centre when the pose is tilted.
+        const headEnd = Math.min(
+          maxY,
+          minY + Math.max(6, Math.round((maxY - minY) * 0.14)),
+        );
+        let sum = 0;
+        let count = 0;
+        for (let y = minY; y <= headEnd; y += 2) {
+          const row = y * width * 4;
+          for (let x = minX; x <= maxX; x += 2) {
+            if (this.maskData[row + x * 4 + 3] > MASK_ALPHA_THRESHOLD) {
+              sum += x;
+              count++;
+            }
+          }
+        }
+        const inv = 1 / scale;
+        this.head = {
+          x: (count > 0 ? sum / count : (minX + maxX) / 2) * inv,
+          y: minY * inv,
+          valid: true,
+        };
+      }
+
       if (!this.maskReported) {
         this.maskReported = true;
         const first = Array.from(this.maskData.slice(0, 16)).join(",");
-        log(`mask ready: ${width}x${height} opaque=${opaque} firstBytes=${first}`);
+        log(
+          `mask ready: ${width}x${height} opaque=${opaque} head=${this.head.x.toFixed(0)},${this.head.y.toFixed(0)} firstBytes=${first}`,
+        );
       }
     } catch (error) {
       log(`mask refresh failed: ${error}`);

@@ -12,6 +12,14 @@ use tauri::tray::{MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent}
 use tauri::{AppHandle, Emitter, Manager, State};
 
 pub const MAIN_WINDOW: &str = "waifu";
+
+/// Title of the main window. A second copy of the app uses it to find the
+/// window of the instance that is already running.
+const MAIN_WINDOW_TITLE: &str = "Ei Waifu";
+
+/// Name of the mutex that keeps a second instance from starting.
+const SINGLE_INSTANCE_MUTEX: &str = r"Local\EiWaifuSingleInstance";
+
 #[derive(Serialize, Deserialize, Clone, Debug)]
 #[serde(rename_all = "camelCase")]
 pub struct AppConfig {
@@ -125,21 +133,64 @@ fn models_root(app: &AppHandle) -> PathBuf {
     }
 }
 
-/// Creates the models directory and, for release builds, seeds it with the
-/// models that were bundled next to the executable.
+/// Folders that may hold the bundled Live2D models. They are used to seed
+/// the models directory in the app data folder, so the app also finds its
+/// models when it is started straight from the build folder.
+fn model_sources(app: &AppHandle) -> Vec<PathBuf> {
+    let mut out: Vec<PathBuf> = Vec::new();
+    let mut push = |path: PathBuf| {
+        if !out.contains(&path) {
+            out.push(path);
+        }
+    };
+
+    if cfg!(debug_assertions) {
+        push(
+            PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+                .join("..")
+                .join("models"),
+        );
+    }
+
+    // installed app: the resources sit next to the executable
+    if let Ok(res) = app.path().resource_dir() {
+        push(res.join("models"));
+    }
+
+    if let Ok(exe) = std::env::current_exe() {
+        if let Some(dir) = exe.parent() {
+            push(dir.join("models"));
+            push(dir.join("resources").join("models"));
+            // <project>\src-tauri\target\release\ei-waifu.exe -> <project>\models
+            push(dir.join("..").join("..").join("models"));
+            push(dir.join("..").join("..").join("..").join("models"));
+        }
+    }
+
+    out
+}
+
+/// Creates the models directory and seeds it with the bundled models when it
+/// is still empty.
 fn ensure_models_dir(app: &AppHandle) -> PathBuf {
     let dir = models_root(app);
     if !dir.exists() {
         let _ = fs::create_dir_all(&dir);
     }
-    if !cfg!(debug_assertions) {
-        if let Ok(res) = app.path().resource_dir() {
-            let src = res.join("models");
-            let empty = fs::read_dir(&dir)
-                .map(|mut d| d.next().is_none())
-                .unwrap_or(true);
-            if src.exists() && empty {
-                let _ = copy_dir(&src, &dir);
+    if cfg!(debug_assertions) {
+        return dir;
+    }
+
+    let empty = fs::read_dir(&dir)
+        .map(|mut d| d.next().is_none())
+        .unwrap_or(true);
+    if empty {
+        for src in model_sources(app) {
+            if src == dir || !src.is_dir() {
+                continue;
+            }
+            if copy_dir(&src, &dir).is_ok() {
+                break;
             }
         }
     }
@@ -299,40 +350,15 @@ fn cursor_pos() -> win::CursorPos {
     win::cursor_pos()
 }
 
+/// Toggles click-through. The webview tests the cursor against the model's
+/// alpha mask (and the UI rectangles) and calls this with the result. The
+/// window is never clipped, so the character keeps her anti-aliased edges and
+/// the desktop compositor blends them per pixel.
 #[tauri::command]
 fn set_passthrough(app: AppHandle, ignore: bool) -> Result<(), String> {
     let hwnd = window_hwnd(&app).ok_or("window not available")?;
     win::set_click_through(hwnd, ignore);
     Ok(())
-}
-
-/// Makes the window react to the mouse only inside the given rectangles,
-/// everything else is click-through. The rectangles are given in css pixels
-/// of the webview, they are scaled to physical pixels here.
-#[tauri::command]
-fn set_click_region(app: AppHandle, rects: Vec<[u32; 4]>) -> Result<(), String> {
-    let window = app.get_webview_window(MAIN_WINDOW).ok_or("no window")?;
-    let hwnd = window.hwnd().map_err(|e| e.to_string())?.0 as isize;
-    let scale = window.scale_factor().unwrap_or(1.0);
-
-    if rects.is_empty() {
-        win::clear_window_region(hwnd);
-        return Ok(());
-    }
-
-    let scaled: Vec<(i32, i32, i32, i32)> = rects
-        .iter()
-        .map(|r| {
-            (
-                (r[0] as f64 * scale).round() as i32,
-                (r[1] as f64 * scale).round() as i32,
-                (r[2] as f64 * scale).round() as i32,
-                (r[3] as f64 * scale).round() as i32,
-            )
-        })
-        .collect();
-
-    win::set_window_region(hwnd, &scaled)
 }
 
 #[tauri::command]
@@ -387,6 +413,32 @@ fn toggle_window(app: AppHandle) -> Result<(), String> {
     } else {
         window.show().map_err(|e| e.to_string())
     }
+}
+
+/// Shows or hides the character. Hiding it is the "turn the model off"
+/// switch: the app stays alive in the tray and can be brought back.
+#[tauri::command]
+fn set_window_visible(app: AppHandle, visible: bool) -> Result<(), String> {
+    let window = app.get_webview_window(MAIN_WINDOW).ok_or("no window")?;
+    if visible {
+        window.show().map_err(|e| e.to_string())
+    } else {
+        window.hide().map_err(|e| e.to_string())
+    }
+}
+
+/// True while the character is on screen.
+#[tauri::command]
+fn window_visible(app: AppHandle) -> bool {
+    app.get_webview_window(MAIN_WINDOW)
+        .and_then(|w| w.is_visible().ok())
+        .unwrap_or(true)
+}
+
+/// Shuts the whole app down.
+#[tauri::command]
+fn quit_app(app: AppHandle) {
+    app.exit(0);
 }
 
 #[tauri::command]
@@ -446,8 +498,63 @@ async fn chat(
 // entry point
 // ---------------------------------------------------------------------------
 
+/// Handles the flags of a second copy of the app. They are forwarded to the
+/// instance that is already running, so the model can be turned off and on
+/// from the command line.
+///
+/// Returns true when the process has done its job and should stop.
+fn handle_cli_command() -> bool {
+    let mut command: Option<&str> = None;
+    for arg in std::env::args().skip(1) {
+        match arg.as_str() {
+            "--hide" | "/hide" => command = Some("hide"),
+            "--show" | "/show" => command = Some("show"),
+            "--toggle" | "/toggle" => command = Some("toggle"),
+            "--quit" | "/quit" => command = Some("quit"),
+            _ => {}
+        }
+    }
+
+    let Some(command) = command else {
+        return false;
+    };
+
+    let handled = match command {
+        "hide" => win::set_window_visible(MAIN_WINDOW_TITLE, false),
+        "show" => win::set_window_visible(MAIN_WINDOW_TITLE, true),
+        "toggle" => win::toggle_window(MAIN_WINDOW_TITLE),
+        "quit" => win::close_window(MAIN_WINDOW_TITLE),
+        _ => false,
+    };
+
+    if !handled {
+        eprintln!("Ei Waifu is not running.");
+    }
+    true
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
+    // A second copy of the app would put a second character on the desktop
+    // and there would be no reliable way to turn that one off again. So the
+    // extra copies only pass on their command and quit.
+    if handle_cli_command() {
+        return;
+    }
+
+    match win::acquire_single_instance(SINGLE_INSTANCE_MUTEX) {
+        Ok(true) => {}
+        Ok(false) => {
+            // Another instance is already running, bring it back to the
+            // screen instead of starting a second character.
+            win::set_window_visible(MAIN_WINDOW_TITLE, true);
+            return;
+        }
+        Err(()) => {
+            // The mutex could not be created, running is better than not.
+        }
+    }
+
     tauri::Builder::default()
         .manage(AppState {
             config: Mutex::new(AppConfig::default()),
@@ -462,11 +569,13 @@ pub fn run() {
             model_base_url,
             cursor_pos,
             set_passthrough,
-            set_click_region,
             window_bounds,
             set_window_position,
             set_always_on_top,
             toggle_window,
+            set_window_visible,
+            window_visible,
+            quit_app,
             open_path,
             detect_backend,
             chat,
@@ -484,6 +593,14 @@ pub fn run() {
                 }
             }
 
+            // Layered windows are required for cross-process click-through, so
+            // enable the style once before the first hit test. Only the
+            // transparent bit is toggled after this.
+            #[cfg(target_os = "windows")]
+            if let Some(hwnd) = window_hwnd(&handle) {
+                win::set_click_through(hwnd, false);
+            }
+
             let models = ensure_models_dir(&handle);
 
             // serve the models over loopback so the Live2D runtime can resolve
@@ -499,17 +616,31 @@ pub fn run() {
             }
 
             // tray menu
-            let toggle = MenuItem::with_id(&handle, "toggle", "Show / hide", true, None::<&str>)?;
+            let toggle =
+                MenuItem::with_id(&handle, "toggle", "Show / hide character", true, None::<&str>)?;
+            let hide = MenuItem::with_id(&handle, "hide", "Hide character", true, None::<&str>)?;
+            let show = MenuItem::with_id(&handle, "show", "Show character", true, None::<&str>)?;
             let chat_item = MenuItem::with_id(&handle, "chat", "Toggle chat", true, None::<&str>)?;
             let models_item =
                 MenuItem::with_id(&handle, "models", "Open models folder", true, None::<&str>)?;
             let config_item =
                 MenuItem::with_id(&handle, "config", "Open config folder", true, None::<&str>)?;
-            let quit = PredefinedMenuItem::quit(&handle, Some("Quit"))?;
+            let quit = PredefinedMenuItem::quit(&handle, Some("Quit Ei Waifu"))?;
             let sep = PredefinedMenuItem::separator(&handle)?;
+            let sep2 = PredefinedMenuItem::separator(&handle)?;
             let menu = Menu::with_items(
                 &handle,
-                &[&toggle, &chat_item, &sep, &models_item, &config_item, &quit],
+                &[
+                    &toggle,
+                    &hide,
+                    &show,
+                    &chat_item,
+                    &sep,
+                    &models_item,
+                    &config_item,
+                    &sep2,
+                    &quit,
+                ],
             )?;
 
             TrayIconBuilder::with_id("main")
@@ -531,6 +662,16 @@ pub fn run() {
                             } else {
                                 let _ = window.show();
                             }
+                        }
+                    }
+                    "hide" => {
+                        if let Some(window) = app.get_webview_window(MAIN_WINDOW) {
+                            let _ = window.hide();
+                        }
+                    }
+                    "show" => {
+                        if let Some(window) = app.get_webview_window(MAIN_WINDOW) {
+                            let _ = window.show();
                         }
                     }
                     "chat" => {

@@ -1,7 +1,7 @@
 :root {
   --accent: #ff9ec7;
   --accent-strong: #ff6fae;
-  --panel: rgba(28, 22, 40, 0.92);
+  --panel: rgba(24, 18, 34, 0.78);
   --panel-border: rgba(255, 158, 199, 0.35);
   --text: #f4eef8;
   --muted: #b7a9c6;
@@ -9,6 +9,23 @@
 
 * {
   box-sizing: border-box;
+}
+
+/* The overlay is frameless: no focus rings on the in-app controls. */
+button:focus,
+button:focus-visible,
+input:focus,
+input:focus-visible,
+.bubble:focus,
+.bubble:focus-visible,
+.chat:focus,
+.chat:focus-visible,
+.chat *,
+.chat *:focus,
+.chat *:focus-visible {
+  outline: none !important;
+  outline-width: 0 !important;
+  outline-style: none !important;
 }
 
 html,
@@ -43,32 +60,29 @@ body {
   top: 8px;
   transform: translateX(-50%);
   max-width: 88%;
-  padding: 10px 14px;
-  border-radius: 14px;
-  background: var(--panel);
-  border: 1px solid var(--panel-border);
-  box-shadow: 0 6px 22px rgba(0, 0, 0, 0.45);
+  padding: 8px 12px;
+  border-radius: 12px;
+  background: transparent !important;
+  /* Frameless: no border, outline, shadow, or panel background. */
+  border: 0 !important;
+  border-width: 0 !important;
+  border-style: none !important;
+  outline: 0 !important;
+  outline-width: 0 !important;
+  outline-style: none !important;
+  outline-color: transparent !important;
+  box-shadow: none !important;
   font-size: 13.5px;
-  line-height: 1.45;
-  backdrop-filter: blur(6px);
+  line-height: 1.5;
+  text-shadow: 0 2px 6px rgba(0, 0, 0, 0.95), 0 0 2px rgba(0, 0, 0, 0.8);
+  backdrop-filter: none !important;
+  -webkit-backdrop-filter: none !important;
   animation: bubble-in 0.18s ease-out;
   z-index: 10;
 }
 
 .bubble[hidden] {
   display: none;
-}
-
-.bubble-tail {
-  position: absolute;
-  left: 50%;
-  bottom: -7px;
-  width: 12px;
-  height: 12px;
-  transform: translateX(-50%) rotate(45deg);
-  background: var(--panel);
-  border-right: 1px solid var(--panel-border);
-  border-bottom: 1px solid var(--panel-border);
 }
 
 @keyframes bubble-in {
@@ -85,19 +99,31 @@ body {
 /* ---------------- chat panel ---------------- */
 
 .chat {
+  /* The panel is anchored by app.ts just above the character's head:
+     `top` is the bottom edge of the panel, the translate keeps it centered. */
   position: absolute;
-  left: 10px;
-  right: 10px;
-  bottom: 10px;
-  max-height: 62%;
+  left: 50%;
+  top: auto;
+  width: min(92%, 420px);
+  min-width: 240px;
+  max-width: 90vw;
+  min-height: 60px;
+  max-height: 62vh;
+  transform: translate(-50%, -100%);
   display: flex;
   flex-direction: column;
-  background: var(--panel);
-  border: 1px solid var(--panel-border);
+  background: transparent;
+  border: 0 !important;
+  outline: 0 !important;
+  outline-width: 0 !important;
+  outline-style: none !important;
+  outline-color: transparent !important;
   border-radius: 14px;
-  box-shadow: 0 10px 30px rgba(0, 0, 0, 0.5);
-  backdrop-filter: blur(8px);
-  overflow: hidden;
+  box-shadow: none !important;
+  backdrop-filter: none !important;
+  -webkit-backdrop-filter: none !important;
+  overflow: auto;
+  resize: both;
   z-index: 20;
 }
 
@@ -114,7 +140,6 @@ body {
   letter-spacing: 0.04em;
   text-transform: uppercase;
   color: var(--accent);
-  border-bottom: 1px solid rgba(255, 255, 255, 0.07);
 }
 
 .chat-close {
@@ -165,7 +190,6 @@ body {
   display: flex;
   gap: 6px;
   padding: 8px;
-  border-top: 1px solid rgba(255, 255, 255, 0.07);
 }
 
 .chat-form input {
@@ -215,8 +239,10 @@ body {
   transform: translateX(-50%);
   padding: 7px 13px;
   border-radius: 9px;
-  background: rgba(20, 16, 28, 0.94);
-  border: 1px solid var(--panel-border);
+  background: rgba(20, 16, 28, 0.82);
+  border: none;
+  outline: none;
+  box-shadow: none;
   font-size: 11.5px;
   color: var(--muted);
   z-index: 30;
@@ -224,4 +250,51 @@ body {
 
 .toast[hidden] {
   display: none;
+}
+
+/* ---------------- context menu ---------------- */
+
+.menu {
+  position: absolute;
+  min-width: 168px;
+  padding: 5px;
+  border-radius: 11px;
+  background: var(--panel);
+  border: 1px solid var(--panel-border);
+  box-shadow: 0 10px 30px rgba(0, 0, 0, 0.5);
+  backdrop-filter: blur(8px);
+  z-index: 40;
+}
+
+.menu[hidden] {
+  display: none;
+}
+
+.menu-item {
+  display: block;
+  width: 100%;
+  padding: 7px 10px;
+  border: none;
+  border-radius: 8px;
+  background: none;
+  color: var(--text);
+  font: inherit;
+  font-size: 12.5px;
+  text-align: left;
+  cursor: pointer;
+}
+
+.menu-item:hover {
+  background: rgba(255, 158, 199, 0.18);
+}
+
+.menu-item-danger:hover {
+  background: rgba(255, 90, 120, 0.22);
+  color: #ffb3c1;
+}
+
+.menu-sep {
+  height: 1px;
+  margin: 4px 6px;
+  background: rgba(255, 255, 255, 0.09);
 }

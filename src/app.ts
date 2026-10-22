@@ -54,21 +54,41 @@ export async function bootstrap(): Promise<void> {
   const chatName = document.getElementById("chat-name") as HTMLSpanElement;
   const chatClose = document.getElementById("chat-close") as HTMLButtonElement;
   const toastEl = document.getElementById("toast") as HTMLDivElement;
+  const menuEl = document.getElementById("menu") as HTMLDivElement;
+  const menuHide = document.getElementById("menu-hide") as HTMLButtonElement;
+  const menuChat = document.getElementById("menu-chat") as HTMLButtonElement;
+  const menuQuit = document.getElementById("menu-quit") as HTMLButtonElement;
 
   chatName.textContent = config.personaName || "Companion";
 
+  // The timers have to exist before the first toast or bubble is shown. The
+  // error paths below run before the ui section, and a `let` that is read
+  // before its declaration throws a temporal dead zone error.
+  let bubbleTimer: number | undefined;
+  let toastTimer: number | undefined;
+
   // ---------------------------------------------------------------- pixi app
+  // Render at least 2x the device pixel ratio. The model is painted at a
+  // fraction of the window size, so supersampling keeps her silhouette and
+  // the soft edges of the artwork smooth instead of stair-stepped.
+  const dpr = window.devicePixelRatio || 1;
+  const renderResolution = Math.min(3, Math.max(2, dpr));
+  log(`renderer: ${renderResolution}x (device pixel ratio ${dpr})`);
+
   const canvas = document.createElement("canvas");
   const app = new Application({
     view: canvas,
     backgroundAlpha: 0,
     background: 0x000000,
     antialias: true,
-    resolution: Math.min(2, window.devicePixelRatio || 1),
+    resolution: renderResolution,
     autoDensity: true,
     resizeTo: stageEl,
+    powerPreference: "high-performance",
   });
-  (app.renderer as any).roundPixels = true;
+  // Sub-pixel positions keep the slow live2d motion smooth. Rounding to whole
+  // pixels made the character jitter by a pixel while she was breathing.
+  (app.renderer as any).roundPixels = false;
   stageEl.appendChild(canvas);
 
   const character = new Character(app, {
@@ -80,6 +100,7 @@ export async function bootstrap(): Promise<void> {
   log(`models found: ${models.length}`, models);
   if (!models.length) {
     showToast("No Live2D model found. Put one in the models folder.");
+    await makeWindowInert();
     return;
   }
 
@@ -97,26 +118,74 @@ export async function bootstrap(): Promise<void> {
   } catch (error) {
     log(`model load failed: ${error}`);
     showToast(`Could not load model: ${error}`);
+    await makeWindowInert();
     return;
   }
 
   character.userScale = config.scale;
   character.applyScale();
   app.ticker.add(() => character.tick());
-  app.renderer.on("resize", () => character.applyScale());
+  app.renderer.on("resize", () => {
+    character.applyScale();
+    layoutBubble();
+    layoutChat();
+  });
 
   // ---------------------------------------------------------------- ui
-  let bubbleTimer: number | undefined;
+  /**
+   * Both dialogue surfaces float above her head. The anchor comes from the
+   * alpha silhouette, so it follows the pose and the zoom level instead of
+   * sitting at a fixed window offset (which could overlap her body).
+   */
+  function layoutBubble(): void {
+    if (bubbleEl.hidden) return;
+    const anchor = character.headAnchor();
+    const gap = 10;
+    const width = bubbleEl.offsetWidth;
+    const height = bubbleEl.offsetHeight;
+    // Place the bubble's bottom edge just above the actual head top, with
+    // a tiny margin. Clamping to the top only happens if there's no room.
+    const top = Math.max(4, Math.round(anchor.y - gap - height));
+    const minX = 8 + width / 2;
+    const maxX = window.innerWidth - 8 - width / 2;
+    const x = Math.min(Math.max(anchor.x, minX), Math.max(minX, maxX));
+    bubbleEl.style.left = `${Math.round(x)}px`;
+    bubbleEl.style.top = `${top}px`;
+    bubbleEl.style.transform = "translateX(-50%)";
+  }
+
+  function layoutChat(): void {
+    if (chatEl.hidden) return;
+    const anchor = character.headAnchor();
+    const gap = 12;
+    // Keep the whole panel inside the window while its bottom edge rests
+    // just above her head.
+    const available = Math.max(100, Math.round(anchor.y - gap - 6));
+    chatEl.style.maxHeight = `${available}px`;
+    const width = chatEl.offsetWidth;
+    const height = chatEl.offsetHeight;
+    const top = Math.max(6 + height, Math.round(anchor.y - gap));
+    const minX = 8 + width / 2;
+    const maxX = window.innerWidth - 8 - width / 2;
+    const x = Math.min(Math.max(anchor.x, minX), Math.max(minX, maxX));
+    chatEl.style.left = `${Math.round(x)}px`;
+    chatEl.style.top = `${top}px`;
+    chatEl.style.transform = "translate(-50%, -100%)";
+  }
+
   function showBubble(text: string, seconds = config.bubbleSeconds): void {
+    // While the chat is open the same line is already in the log, and both
+    // panels would compete for the space above her head.
+    if (!chatEl.hidden) return;
     bubbleText.textContent = text;
     bubbleEl.hidden = false;
+    layoutBubble();
     window.clearTimeout(bubbleTimer);
     bubbleTimer = window.setTimeout(() => {
       bubbleEl.hidden = true;
     }, Math.max(1500, seconds * 1000));
   }
 
-  let toastTimer: number | undefined;
   function showToast(text: string): void {
     toastEl.textContent = text;
     toastEl.hidden = false;
@@ -124,6 +193,18 @@ export async function bootstrap(): Promise<void> {
     toastTimer = window.setTimeout(() => {
       toastEl.hidden = true;
     }, 5000);
+  }
+
+  /**
+   * A window without a character is invisible but would still swallow every
+   * click in its area. Making it click-through keeps the desktop usable.
+   */
+  async function makeWindowInert(): Promise<void> {
+    try {
+      await api.setPassthrough(true);
+    } catch {
+      /* not critical */
+    }
   }
 
   function logMessage(text: string, who: "user" | "her" | "system"): void {
@@ -139,9 +220,10 @@ export async function bootstrap(): Promise<void> {
     chatEl.hidden = !show;
     log(`chat panel ${show ? "opened" : "closed"}`);
     if (show) {
+      bubbleEl.hidden = true;
+      layoutChat();
       chatInput.focus();
     }
-    void updateClickRegion(true);
   }
 
   // ---------------------------------------------------------------- chat
@@ -182,6 +264,57 @@ export async function bootstrap(): Promise<void> {
     void api.openPath(event.payload);
   });
 
+  // ---------------------------------------------------------------- menu
+  // Right clicking the character opens a small menu. It is the most direct
+  // way to turn the model off without hunting for the tray icon.
+  let menuOpen = false;
+
+  function closeMenu(): void {
+    if (!menuOpen) return;
+    menuOpen = false;
+    menuEl.hidden = true;
+  }
+
+  function openMenu(x: number, y: number): void {
+    menuOpen = true;
+    menuEl.hidden = false;
+    // Keep the menu inside of the window.
+    const maxX = Math.max(4, window.innerWidth - menuEl.offsetWidth - 4);
+    const maxY = Math.max(4, window.innerHeight - menuEl.offsetHeight - 4);
+    menuEl.style.left = `${Math.round(Math.min(Math.max(4, x), maxX))}px`;
+    menuEl.style.top = `${Math.round(Math.min(Math.max(4, y), maxY))}px`;
+  }
+
+  menuHide.addEventListener("click", async () => {
+    closeMenu();
+    log("character hidden from the menu");
+    await api.setWindowVisible(false);
+  });
+
+  menuChat.addEventListener("click", () => {
+    closeMenu();
+    toggleChat(true);
+  });
+
+  menuQuit.addEventListener("click", () => {
+    closeMenu();
+    void api.quitApp();
+  });
+
+  canvas.addEventListener("contextmenu", (event) => {
+    // The webview would show its own menu, which is not what we want here.
+    event.preventDefault();
+    openMenu(event.clientX, event.clientY);
+  });
+
+  // A click somewhere else closes the menu again.
+  window.addEventListener("pointerdown", (event) => {
+    if (!menuOpen) return;
+    const target = event.target as Node | null;
+    if (target && menuEl.contains(target)) return;
+    closeMenu();
+  });
+
   // ---------------------------------------------------------------- tapping
   function handleTap(areas: string[]): void {
     const lower = areas.map((a) => a.toLowerCase());
@@ -192,19 +325,16 @@ export async function bootstrap(): Promise<void> {
       const line = pick(HEAD_REACTIONS);
       chat.say(line);
       showBubble(line);
-      void updateClickRegion(true);
     } else if (lower.some((a) => a.includes("body"))) {
       character.motion("TapBody", 1, 3);
       character.expression("F03");
       const line = pick(BODY_REACTIONS);
       chat.say(line);
       showBubble(line);
-      void updateClickRegion(true);
     } else {
       const line = pick(IDLE_REACTIONS);
       chat.say(line);
       showBubble(line);
-      void updateClickRegion(true);
     }
   }
 
@@ -270,24 +400,27 @@ export async function bootstrap(): Promise<void> {
       config.scale = clamp(config.scale * factor, 0.55, 4.5);
       character.userScale = config.scale;
       character.applyScale();
+      layoutBubble();
+      layoutChat();
       void api.setConfig(config);
     },
     { passive: false },
   );
 
-  // ---------------------------------------------------------------- click through
-  // The window is only allowed to react to the mouse where the character and
-  // the ui are visible. Everywhere else the click goes through to whatever is
-  // behind the window. This is done with a window region, because the
-  // WebView2 child windows would swallow the clicks otherwise.
-  let regionVersion = -1;
-  let regionRectsCount = 0;
-  let lastRegionUpdate = 0;
-  const REGION_MIN_INTERVAL = 140;
+  // ---------------------------------------------------------------- hit testing
+  // The window is never clipped. WebView2 renders the character with a full
+  // 8-bit alpha channel and DWM blends it per pixel with the desktop, so the
+  // soft anti-aliased edge of the artwork is preserved. Only mouse handling is
+  // gated: when the cursor is not over an opaque model pixel or a UI panel the
+  // window becomes WS_EX_TRANSPARENT, so the click falls through to whatever
+  // is below it. Hit-testing uses the same alpha mask the old window region
+  // was built from, but it no longer affects what is drawn.
+  let passthrough = false;
+  let interactive = false;
 
   function uiRects(): Rect[] {
     const rects: Rect[] = [];
-    for (const el of [chatEl, bubbleEl, toastEl]) {
+    for (const el of [chatEl, bubbleEl, toastEl, menuEl]) {
       if (el.hidden) continue;
       const box = el.getBoundingClientRect();
       if (box.width < 1 || box.height < 1) continue;
@@ -301,27 +434,27 @@ export async function bootstrap(): Promise<void> {
     return rects;
   }
 
-  async function updateClickRegion(force = false): Promise<void> {
-    const now = performance.now();
-    if (!force && pointerDown) return;
-    if (!force && character.maskVersion === regionVersion && now - lastRegionUpdate < REGION_MIN_INTERVAL) return;
-    if (!force && character.maskVersion === regionVersion) return;
-    regionVersion = character.maskVersion;
-    lastRegionUpdate = now;
+  function isOverUi(x: number, y: number): boolean {
+    return uiRects().some(
+      (r) => x >= r.x && y >= r.y && x <= r.x + r.w && y <= r.y + r.h,
+    );
+  }
 
-    const rects = config.clickThrough
-      ? [...character.regionRects(), ...uiRects()]
-      : [];
-    regionRectsCount = rects.length;
+  async function setPassthrough(next: boolean): Promise<void> {
+    if (next === passthrough) return;
+    passthrough = next;
     try {
-      await api.setClickRegion(rects);
+      await api.setPassthrough(next);
     } catch (error) {
-      console.error("could not update the click region", error);
+      console.error("could not change mouse passthrough", error);
     }
   }
 
   // ---------------------------------------------------------------- polling
   let lastCursor = { x: 0, y: 0 };
+  let characterVisible = true;
+  let lastVisibleCheck = 0;
+  let lastOverlayLayout = 0;
 
   window.setInterval(async () => {
     try {
@@ -341,6 +474,8 @@ export async function bootstrap(): Promise<void> {
       lastCursor = cursor;
 
       if (dragging) {
+        // The button is held, so the window must stay interactive.
+        await setPassthrough(false);
         await api.setWindowPosition(
           windowOrigin.x + (cursor.x - dragOrigin.x),
           windowOrigin.y + (cursor.y - dragOrigin.y),
@@ -353,10 +488,38 @@ export async function bootstrap(): Promise<void> {
 
       character.focus(sx, sy);
 
-      // While the mouse is held down the region must not change, otherwise
-      // the window would lose the cursor in the middle of a drag.
       if (!pointerDown) {
-        await updateClickRegion();
+        const active = !config.clickThrough || isOverUi(sx, sy) || character.isOpaqueAt(sx, sy);
+        interactive = active;
+        await setPassthrough(!active);
+      }
+
+      // A hidden character does not have to be animated, that saves a lot of
+      // cpu while she is turned off.
+      const now = performance.now();
+
+      // The alpha mask (and therefore the head position) refreshes a few times
+      // per second. Keep the dialogue surfaces glued to it without touching the
+      // DOM on every single poll.
+      if (now - lastOverlayLayout > 180) {
+        lastOverlayLayout = now;
+        layoutBubble();
+        layoutChat();
+      }
+
+      if (now - lastVisibleCheck > 1000) {
+        lastVisibleCheck = now;
+        const visible = await api.windowVisible();
+        if (visible !== characterVisible) {
+          characterVisible = visible;
+          log(`character ${visible ? "shown" : "hidden"}`);
+          if (visible) {
+            app.ticker.start();
+          } else {
+            app.ticker.stop();
+            await setPassthrough(true);
+          }
+        }
       }
     } catch (error) {
       console.error("poll failed", error);
@@ -389,7 +552,7 @@ export async function bootstrap(): Promise<void> {
       : 0;
     const model = character.model;
     log(
-      `heartbeat: fps=${app.ticker.FPS.toFixed(0)} opaque=${character.opaquePixels}/${character.maskPixels} (${ratio.toFixed(1)}%) region=${regionRectsCount} model=${model ? `${model.scale.x.toFixed(3)}@${model.position.x.toFixed(0)},${model.position.y.toFixed(0)}` : "none"}`,
+      `heartbeat: fps=${app.ticker.FPS.toFixed(0)} opaque=${character.opaquePixels}/${character.maskPixels} (${ratio.toFixed(1)}%) mouse=${interactive ? "interactive" : "through"} model=${model ? `${model.scale.x.toFixed(3)}@${model.position.x.toFixed(0)},${model.position.y.toFixed(0)}` : "none"}`,
     );
   }, 5000);
 
