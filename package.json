@@ -1,0 +1,33 @@
+{
+  "name": "ei-waifu",
+  "version": "0.1.0",
+  "description": "A desktop waifu companion that lives on your windows desktop",
+  "type": "module",
+  "private": true,
+  "scripts": {
+    "dev": "vite",
+    "build": "tsc --noEmit && vite build",
+    "preview": "vite preview",
+    "tauri": "tauri",
+    "tauri:dev": "tauri dev",
+    "tauri:build": "tauri build"
+  },
+  "keywords": [
+    "live2d",
+    "tauri",
+    "pixi",
+    "desktop-companion"
+  ],
+  "license": "MIT",
+  "dependencies": {
+    "@tauri-apps/api": "^2.12.4",
+    "pixi-live2d-display": "^0.5.0-beta",
+    "pixi.js": "^7.4.3"
+  },
+  "devDependencies": {
+    "@tauri-apps/cli": "^2.12.4",
+    "@types/node": "^26.6.5",
+    "typescript": "^7.0.2",
+    "vite": "^8.3.5"
+  }
+}

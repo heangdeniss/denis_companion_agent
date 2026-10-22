@@ -1,0 +1,33 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Ei Waifu</title>
+    <script src="/live2dcubismcore.min.js"></script>
+  </head>
+  <body>
+    <div id="stage"></div>
+
+    <div id="bubble" class="bubble" hidden>
+      <span id="bubble-text"></span>
+      <i class="bubble-tail"></i>
+    </div>
+
+    <section id="chat" class="chat" hidden>
+      <header class="chat-header">
+        <span id="chat-name">Aria</span>
+        <button id="chat-close" class="chat-close" title="Hide chat">&times;</button>
+      </header>
+      <div id="chat-log" class="chat-log"></div>
+      <form id="chat-form" class="chat-form" autocomplete="off">
+        <input id="chat-input" type="text" placeholder="Say something to her..." autocomplete="off" />
+        <button type="submit">Send</button>
+      </form>
+    </section>
+
+    <div id="toast" class="toast" hidden></div>
+
+    <script type="module" src="/src/main.ts"></script>
+  </body>
+</html>

@@ -1,0 +1,1 @@
+{"default":{"identifier":"default","description":"Capabilities for the waifu window","local":true,"windows":["waifu"],"permissions":["core:default","core:window:allow-set-focus","core:window:allow-set-always-on-top","core:window:allow-set-position","core:window:allow-set-size","core:window:allow-show","core:window:allow-hide","core:webview:allow-internal-toggle-devtools"]}}
