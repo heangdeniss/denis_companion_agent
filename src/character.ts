@@ -1,15 +1,32 @@
-import { Application, MIPMAP_MODES, RenderTexture, SCALE_MODES } from "pixi.js";
-import { Live2DModel } from "pixi-live2d-display/cubism4";
+import { Application, MIPMAP_MODES, RenderTexture, SCALE_MODES, Texture } from "pixi.js";
+import { Live2DModel, MotionPreloadStrategy } from "pixi-live2d-display/cubism4";
 import { log } from "./logger";
+import type { OutfitEntry } from "./types";
 
 /** How often the alpha mask is refreshed (ms). */
 const MASK_INTERVAL = 95;
 /** Pixels with a lower alpha are considered empty and stay click-through. */
 const MASK_ALPHA_THRESHOLD = 12;
-
-export interface CharacterEvents {
-  onTap?: (hitAreas: string[]) => void;
-}
+/**
+ * A reaction (motion + expression) is held for this long. A second request
+ * inside that window is dropped, so a motion that is still playing is never
+ * restarted - that is what made her jump between the poses.
+ */
+const REACTION_COOLDOWN = 1600;
+/**
+ * The mouth follows its own rhythm while she is talking. These are the
+ * frequencies of the two slow waves it is built from.
+ */
+const TALK_FREQUENCY_A = 8.7;
+const TALK_FREQUENCY_B = 4.3;
+/**
+ * Height the character is drawn at when the zoom is at 100%. The overlay is
+ * only as tall as she is, so a smaller window does not mean a smaller
+ * character - only a wider one does.
+ */
+const MAX_SPRITE_HEIGHT = 480;
+/** Room that is kept free above the character for the speech bubble. */
+const HEAD_ROOM = 8;
 
 /**
  * Owns the Live2D model, the pixi application and everything that makes the
@@ -34,8 +51,19 @@ export class Character {
   /** Top-center of the visible silhouette in css pixels, updated with the mask. */
   private head = { x: 0, y: 0, valid: false };
   private mouth = 0;
-  private mouthTarget = 0;
-  private events: CharacterEvents = {};
+
+  /** True while she is talking. The mouth moves on its own clock then. */
+  private talking = false;
+  /** The clock of the mouth animation, in milliseconds. */
+  private talkClock = 0;
+  /** The moment the last reaction was played. */
+  private lastReactionAt = Number.NEGATIVE_INFINITY;
+  /** The last motion that was played, used to not repeat it right away. */
+  private lastMotion = "";
+  /** Counts the started motions, a jump in the number means a flicker. */
+  motionStarts = 0;
+  /** Counts the changed expressions. */
+  expressionChanges = 0;
 
   /** Number of pixels covered by the character, refreshed with the mask. */
   opaquePixels = 0;
@@ -45,22 +73,52 @@ export class Character {
 
   private maskReported = false;
 
-  constructor(app: Application, events: CharacterEvents = {}) {
+  /**
+   * The atlases of the base model. They are kept so that the default outfit
+   * can be put back at any time.
+   */
+  private baseTextures: Texture[] = [];
+  /** The atlases of the outfits that were worn already. */
+  private outfitTextures = new Map<string, Texture[]>();
+  /** The id of the outfit she is wearing. */
+  private outfitId = "default";
+  /** The anisotropic filtering that is used for the atlases. */
+  private anisotropy = 1;
+
+  constructor(app: Application) {
     this.app = app;
-    this.events = events;
   }
 
   async load(url: string): Promise<Live2DModel> {
-    // the ticker is required, otherwise the plugin refuses to animate the model
-    const model = await Live2DModel.from(url, { ticker: this.app.ticker });
+    // The ticker is required, otherwise the plugin refuses to animate the
+    // model. Every motion is loaded up front: a motion that has to be
+    // fetched first would pop into place a moment after the click, and that
+    // looks like a flicker.
+    const model = await Live2DModel.from(url, {
+      ticker: this.app.ticker,
+      motionPreload: MotionPreloadStrategy.ALL,
+    });
     this.model = model;
     this.app.stage.addChild(model);
+    // The atlases of the base model are the fallback for every outfit.
+    this.baseTextures = model.textures.slice();
     this.naturalWidth = model.width || 1;
     this.naturalHeight = model.height || 1;
     this.applyScale();
 
-    model.on("hit", (areas: string[]) => {
-      this.events.onTap?.(areas);
+    // The mouth is written right after the motions have been applied, so it
+    // is not overwritten by the curves of the motion that is playing.
+    const internal = model.internalModel as unknown as {
+      on: (event: string, listener: () => void) => void;
+      motionManager: {
+        on: (event: string, listener: () => void) => void;
+      };
+    };
+    internal.on("afterMotionUpdate", () => this.applyMouth());
+    // Every motion that is really started is counted. A fast growing number
+    // in the heartbeat means she is changing her pose over and over again.
+    internal.motionManager.on("motionStart", () => {
+      this.motionStarts++;
     });
 
     this.optimizeTextures(model);
@@ -69,7 +127,46 @@ export class Character {
       `model ready: ${this.naturalWidth}x${this.naturalHeight} scale=${model.scale.x.toFixed(3)} pos=${model.position.x.toFixed(1)},${model.position.y.toFixed(1)} textures=${model.textures.length} renderer=${this.app.renderer.type} viewport=${this.viewport().width}x${this.viewport().height}`,
     );
 
+    await this.preload();
+
     return model;
+  }
+
+  /**
+   * Loads all motions and all expressions.
+   *
+   * Without it the first reaction has to wait for the network: the pose
+   * would jump a moment after the click and the face would change twice.
+   */
+  private async preload(): Promise<void> {
+    const internal = this.model?.internalModel as unknown as {
+      motionManager: {
+        definitions: Record<string, unknown[]>;
+        loadMotion: (group: string, index: number) => Promise<unknown>;
+        expressionManager?: {
+          definitions: unknown[];
+          loadExpression: (index: number) => Promise<unknown>;
+        };
+      };
+    } | undefined;
+    if (!internal) return;
+
+    const manager = internal.motionManager;
+    const jobs: Promise<unknown>[] = [];
+    for (const group of Object.keys(manager.definitions ?? {})) {
+      const count = manager.definitions[group]?.length ?? 0;
+      for (let index = 0; index < count; index++) {
+        jobs.push(manager.loadMotion(group, index).catch(() => undefined));
+      }
+    }
+    const expressions = manager.expressionManager;
+    if (expressions?.definitions) {
+      for (let index = 0; index < expressions.definitions.length; index++) {
+        jobs.push(expressions.loadExpression(index).catch(() => undefined));
+      }
+    }
+    await Promise.all(jobs);
+    log(`preloaded ${jobs.length} motions and expressions`);
   }
 
   /**
@@ -87,6 +184,7 @@ export class Character {
       }
     }
     const anisotropicLevel = Math.max(1, Math.min(8, maxAnisotropy));
+    this.anisotropy = anisotropicLevel;
 
     for (const texture of model.textures) {
       const base = texture.baseTexture;
@@ -100,18 +198,166 @@ export class Character {
     );
   }
 
-  /** Fits the character into the window, anchored to the bottom centre. */
+  /** The id of the outfit she is wearing. */
+  currentOutfit(): string {
+    return this.outfitId;
+  }
+
+  /**
+   * Puts another outfit on her.
+   *
+   * An outfit is a second set of texture atlases that uses the same UV layout
+   * as the base model. The mesh, the physics, the expressions and the motions
+   * are not touched at all - only the pixels of the atlases are replaced.
+   * That is why switching an outfit can never move her head or break the
+   * alignment of the overlay, and why the model does not have to be reloaded
+   * (a reload would show a blank frame).
+   *
+   * The swap happens between two frames, so the change is clean: there is no
+   * flicker and no stale silhouette, the mask is refreshed right after it.
+   *
+   * @param outfit the outfit to wear, `null` puts the default outfit back.
+   * @param baseUrl the url of the server that serves the assets.
+   * @returns false when the artwork could not be loaded, the default outfit
+   *          is worn in that case.
+   */
+  async setOutfit(
+    outfit: OutfitEntry | null,
+    baseUrl: string,
+  ): Promise<boolean> {
+    const model = this.model;
+    if (!model) return false;
+
+    if (!outfit || outfit.id === "default" || !outfit.textures.length) {
+      this.applyTextures(this.baseTextures);
+      this.outfitId = "default";
+      log(`outfit: default (${model.textures.length} atlases)`);
+      return true;
+    }
+
+    const textures = await this.loadOutfitTextures(outfit, baseUrl);
+    if (!textures) {
+      // The artwork is broken or does not fit: the default outfit stays on.
+      this.applyTextures(this.baseTextures);
+      this.outfitId = "default";
+      return false;
+    }
+
+    this.applyTextures(textures);
+    this.outfitId = outfit.id;
+    log(`outfit: ${outfit.id} (${textures.length} atlases)`);
+    return true;
+  }
+
+  /**
+   * Loads the atlases of an outfit.
+   *
+   * They are only fetched once, afterwards they are reused. The result is
+   * `null` when a file is missing or when an atlas is not exactly as big as
+   * the one it replaces - the mesh addresses the pixels by UV coordinates, so
+   * a different size would stretch the drawing.
+   */
+  private async loadOutfitTextures(
+    outfit: OutfitEntry,
+    baseUrl: string,
+  ): Promise<Texture[] | null> {
+    const cached = this.outfitTextures.get(outfit.id);
+    if (cached) return cached;
+
+    try {
+      const loaded = await Promise.all(
+        outfit.textures.map(async (texture) => {
+          const path = texture.file
+            .split("/")
+            .map(encodeURIComponent)
+            .join("/");
+          const url = `${baseUrl}${outfit.path}/${path}`;
+          const atlas = await Texture.fromURL(url, {
+            scaleMode: SCALE_MODES.LINEAR,
+            mipmap: MIPMAP_MODES.ON,
+            anisotropicLevel: this.anisotropy,
+          });
+          return { index: texture.index, atlas };
+        }),
+      );
+
+      for (const { index, atlas } of loaded) {
+        const base = this.baseTextures[index];
+        if (!base) {
+          throw new Error(`the model has no atlas ${index}`);
+        }
+        if (atlas.width !== base.width || atlas.height !== base.height) {
+          throw new Error(
+            `atlas ${index} is ${atlas.width}x${atlas.height}, the model needs ${base.width}x${base.height}`,
+          );
+        }
+      }
+
+      // The atlases that the outfit does not replace stay the base ones.
+      const textures = this.baseTextures.slice();
+      for (const { index, atlas } of loaded) {
+        textures[index] = atlas;
+      }
+      this.outfitTextures.set(outfit.id, textures);
+      return textures;
+    } catch (error) {
+      log(`outfit ${outfit.id} could not be loaded: ${error}`);
+      return null;
+    }
+  }
+
+  /**
+   * Puts the given atlases into the model.
+   *
+   * The renderer binds the atlases by their index, so replacing them in place
+   * is enough: the mesh, the anchor and every motion stay untouched.
+   */
+  private applyTextures(textures: Texture[]): void {
+    const model = this.model;
+    if (!model) return;
+    for (let index = 0; index < model.textures.length; index++) {
+      const atlas = textures[index];
+      if (atlas) model.textures[index] = atlas;
+    }
+    // The silhouette may have changed, the hit map has to follow it.
+    this.lastMaskAt = 0;
+  }
+
+  /**
+   * Fits the character into the window, anchored to the bottom centre.
+   *
+   * The height she would like to have only depends on the width of the
+   * window and on the zoom level. That way the overlay can be resized (and
+   * made taller for the chat panel) without changing her size.
+   */
   applyScale(): void {
     const model = this.model;
     if (!model) return;
     const { width, height } = this.viewport();
-    const fit = Math.min(width / this.naturalWidth, height / this.naturalHeight);
-    const scale = Math.max(0.05, fit * 0.98 * this.userScale);
+    // She is never bigger than the window, but she is not scaled down for the
+    // empty space above her either.
+    const room = Math.max(120, height - HEAD_ROOM);
+    const target = Math.min(this.targetHeight(), room);
+    const scale = Math.max(0.05, target / this.naturalHeight);
     model.scale.set(scale);
     model.position.set(
       (width - this.naturalWidth * scale) / 2,
       height - this.naturalHeight * scale,
     );
+  }
+
+  /** The height she would like to have, without looking at the window. */
+  targetHeight(): number {
+    const { width } = this.viewport();
+    const byWidth = (width / this.naturalWidth) * this.naturalHeight;
+    return Math.max(120, Math.min(MAX_SPRITE_HEIGHT * this.userScale, byWidth));
+  }
+
+  /** Height of the drawn sprite in css pixels. */
+  spriteHeight(): number {
+    const model = this.model;
+    if (!model) return 0;
+    return this.naturalHeight * model.scale.x;
   }
 
   /**
@@ -149,6 +395,7 @@ export class Character {
     if (!this.model) return;
     try {
       this.model.motion(group, index, priority);
+      this.lastMotion = `${group}:${index}`;
       // Force mask refresh on pose change to avoid inheriting old bounding boxes
       this.lastMaskAt = 0;
     } catch {
@@ -161,15 +408,79 @@ export class Character {
     if (!this.model) return;
     try {
       this.model.expression(name);
+      this.expressionChanges++;
       this.lastMaskAt = 0;
     } catch {
       /* expression not present in this model */
     }
   }
 
-  /** 0 = closed mouth, 1 = wide open. */
-  setMouthOpen(amount: number): void {
-    this.mouthTarget = Math.max(0, Math.min(1, amount));
+  /**
+   * She starts talking.
+   *
+   * From now on the mouth moves on its own rhythm. The text stream has no
+   * say in it: if every token would open the mouth again she would look like
+   * she is stuttering instead of speaking.
+   */
+  startTalking(): void {
+    if (this.talking) return;
+    this.talking = true;
+    log("animation: talking");
+  }
+
+  /** She stops talking, the mouth closes slowly. */
+  stopTalking(): void {
+    if (!this.talking) return;
+    this.talking = false;
+    log("animation: idle");
+  }
+
+  /**
+   * Plays a reaction: a motion and an expression.
+   *
+   * Only one reaction runs at a time. A second request inside the cooldown
+   * is dropped, so a motion that is still playing is never restarted - that
+   * is what made her jump between the poses.
+   *
+   * @returns true when the reaction was played.
+   */
+  react(motion: string | null, expression: string | null, index = 0): boolean {
+    const now = performance.now();
+    if (now - this.lastReactionAt < REACTION_COOLDOWN) return false;
+    this.lastReactionAt = now;
+    if (motion) this.motion(motion, index, 3);
+    if (expression) this.expression(expression);
+    return true;
+  }
+
+  /**
+   * A short description of the animation state. It is written to the
+   * heartbeat so a flicker is visible in the log as a rising counter.
+   */
+  animationState(): string {
+    const internal = this.model?.internalModel as unknown as {
+      motionManager?: {
+        state?: {
+          currentGroup?: string;
+          currentIndex?: number;
+          currentPriority?: number;
+        };
+        expressionManager?: { currentExpressionIndex?: number };
+      };
+    } | undefined;
+    const manager = internal?.motionManager;
+    const state = manager?.state;
+    const expression = manager?.expressionManager?.currentExpressionIndex;
+    return [
+      `talk=${this.talking ? 1 : 0}`,
+      `mouth=${this.mouth.toFixed(2)}`,
+      `motion=${state?.currentGroup ?? "-"}:${state?.currentIndex ?? "-"}`,
+      `prio=${state?.currentPriority ?? 0}`,
+      `expr=${expression ?? "-"}`,
+      `starts=${this.motionStarts}`,
+      `exprChanges=${this.expressionChanges}`,
+      `last=${this.lastMotion || "-"}`,
+    ].join(" ");
   }
 
   /**
@@ -204,18 +515,95 @@ export class Character {
     return { x: width / 2, y: height * 0.45 };
   }
 
-  /** Called from the pixi ticker. */
-  tick(): void {
-    // ease the mouth towards the target so it does not snap
-    this.mouth += (this.mouthTarget - this.mouth) * 0.4;
-    this.mouthTarget *= 0.82;
-    this.applyMouth();
+  /**
+   * The silhouette of the character as a packed bit map: one bit per cell,
+   * `1` means the cell is covered by her. The native hit test uses it to
+   * decide per pixel whether a click belongs to the character.
+   *
+   * A cell is a few css pixels wide, which keeps the payload small enough to
+   * send it to the backend a few times per second.
+   */
+  hitMap(cell = 2): { bits: number[]; cols: number; rows: number; cell: number } | null {
+    const data = this.maskData;
+    if (!data) return null;
+    const { width, height } = this.viewport();
+    const cols = Math.max(1, Math.ceil(width / cell));
+    const rows = Math.max(1, Math.ceil(height / cell));
+    const bytes = new Uint8Array(Math.ceil((cols * rows) / 8));
+    const scale = this.maskScale;
 
-    const now = performance.now();
-    if (now - this.lastMaskAt > MASK_INTERVAL) {
-      this.lastMaskAt = now;
-      this.refreshMask();
+    for (let cy = 0; cy < rows; cy++) {
+      for (let cx = 0; cx < cols; cx++) {
+        const centreX = (cx + 0.5) * cell;
+        const centreY = (cy + 0.5) * cell;
+        // Four samples per cell: a single hair strand is still thick enough
+        // to be found.
+        let opaque = false;
+        for (let sy = 0; sy < 2 && !opaque; sy++) {
+          for (let sx = 0; sx < 2 && !opaque; sx++) {
+            const mx = Math.floor((centreX + (sx - 0.5) * cell) * scale);
+            const my = Math.floor((centreY + (sy - 0.5) * cell) * scale);
+            if (mx < 0 || my < 0 || mx >= this.maskWidth || my >= this.maskHeight) continue;
+            if (data[(my * this.maskWidth + mx) * 4 + 3] > MASK_ALPHA_THRESHOLD) {
+              opaque = true;
+            }
+          }
+        }
+        if (opaque) {
+          const index = cy * cols + cx;
+          bytes[index >> 3] |= 0x80 >> (index & 7);
+        }
+      }
     }
+
+    return { bits: Array.from(bytes), cols, rows, cell };
+  }
+
+  /**
+   * Called from the pixi ticker.
+   *
+   * This only advances the mouth. Nothing in here depends on the text
+   * stream, so the animation keeps running at a steady rate while she is
+   * speaking.
+   */
+  tick(dt: number): void {
+    this.updateMouth(dt);
+  }
+
+  /**
+   * The mouth is animated by a small oscillator of its own.
+   *
+   * Two slow waves with different lengths are mixed, that looks a lot more
+   * like speech than a single sine. When she stops talking the mouth closes
+   * over a moment instead of snapping shut.
+   */
+  private updateMouth(dt: number): void {
+    if (this.talking) {
+      this.talkClock += dt;
+      const t = this.talkClock / 1000;
+      const wave =
+        Math.sin(t * TALK_FREQUENCY_A) * 0.55 +
+        Math.sin(t * TALK_FREQUENCY_B + 1.1) * 0.3 +
+        Math.sin(t * (TALK_FREQUENCY_A + TALK_FREQUENCY_B) * 0.6) * 0.15;
+      const open = 0.45 + 0.45 * wave;
+      this.mouth += (open - this.mouth) * Math.min(1, dt / 45);
+    } else {
+      this.mouth += (0 - this.mouth) * Math.min(1, dt / 220);
+    }
+  }
+
+  /**
+   * Refreshes the alpha mask.
+   *
+   * This runs *after* the frame was drawn (a low ticker priority), so the
+   * mask shows exactly what is on the screen and the extra render does not
+   * interrupt the frame that is being drawn.
+   */
+  updateMask(): void {
+    const now = performance.now();
+    if (now - this.lastMaskAt <= MASK_INTERVAL) return;
+    this.lastMaskAt = now;
+    this.refreshMask();
   }
 
   private applyMouth(): void {
@@ -333,6 +721,14 @@ export class Character {
     this.maskTexture?.destroy(true);
     this.maskTexture = null;
     this.maskData = null;
+    for (const textures of this.outfitTextures.values()) {
+      for (const texture of textures) {
+        // The base atlases are owned by the model, they must not be destroyed
+        // twice.
+        if (!this.baseTextures.includes(texture)) texture.destroy(true);
+      }
+    }
+    this.outfitTextures.clear();
     this.model?.destroy();
     this.model = null;
   }

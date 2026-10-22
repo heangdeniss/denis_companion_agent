@@ -1,12 +1,20 @@
 import { listen } from "@tauri-apps/api/event";
-import { Application } from "pixi.js";
+import { Application, UPDATE_PRIORITY } from "pixi.js";
 import { Character } from "./character";
 import { Chat } from "./chat";
 import { api } from "./ipc";
 import { log } from "./logger";
+import { groupOutfits, mergeOutfits, DEFAULT_OUTFIT } from "./outfits";
 import type { AppConfig, Rect } from "./types";
 
 const POLL_INTERVAL = 40;
+/** How often the silhouette is handed over to the native hit test (ms). */
+const HIT_MAP_INTERVAL = 120;
+/** Room that is kept free above the character for the speech bubble. */
+const BUBBLE_SPACE = 56;
+/** Smallest size the overlay may be dragged to. */
+const MIN_WIDTH = 220;
+const MIN_HEIGHT = 200;
 
 const GREETINGS = [
   "Hi~ You're finally here.",
@@ -49,15 +57,21 @@ export async function bootstrap(): Promise<void> {
   const bubbleText = document.getElementById("bubble-text") as HTMLSpanElement;
   const chatEl = document.getElementById("chat") as HTMLElement;
   const chatLog = document.getElementById("chat-log") as HTMLDivElement;
+  const chatStatus = document.getElementById("chat-status") as HTMLDivElement;
   const chatForm = document.getElementById("chat-form") as HTMLFormElement;
   const chatInput = document.getElementById("chat-input") as HTMLInputElement;
   const chatName = document.getElementById("chat-name") as HTMLSpanElement;
   const chatClose = document.getElementById("chat-close") as HTMLButtonElement;
   const toastEl = document.getElementById("toast") as HTMLDivElement;
-  const menuEl = document.getElementById("menu") as HTMLDivElement;
+  const menuEl = document.getElementById("menu") as HTMLMenuElement;
   const menuHide = document.getElementById("menu-hide") as HTMLButtonElement;
   const menuChat = document.getElementById("menu-chat") as HTMLButtonElement;
+  const menuOutfit = document.getElementById("menu-outfit") as HTMLButtonElement;
+  const menuSize = document.getElementById("menu-size") as HTMLButtonElement;
   const menuQuit = document.getElementById("menu-quit") as HTMLButtonElement;
+  const outfitPanel = document.getElementById("outfit-panel") as HTMLElement;
+  const outfitList = document.getElementById("outfit-list") as HTMLDivElement;
+  const gripEl = document.getElementById("resize-grip") as HTMLDivElement;
 
   chatName.textContent = config.personaName || "Companion";
 
@@ -67,10 +81,16 @@ export async function bootstrap(): Promise<void> {
   let bubbleTimer: number | undefined;
   let toastTimer: number | undefined;
 
+  // The native hit test lets the mouse through every empty pixel of the
+  // overlay. When it is not available the whole window is made click-through
+  // instead, which is the fallback for other platforms.
+  const nativeHitTest = await api.hitTestAvailable();
+  log(`native hit test: ${nativeHitTest}`);
+
   // ---------------------------------------------------------------- pixi app
   // Render at least 2x the device pixel ratio. The model is painted at a
   // fraction of the window size, so supersampling keeps her silhouette and
-  // the soft edges of the artwork smooth instead of stair-stepped.
+  // the soft edges of the artwork smooth instead of stair-stepping.
   const dpr = window.devicePixelRatio || 1;
   const renderResolution = Math.min(3, Math.max(2, dpr));
   log(`renderer: ${renderResolution}x (device pixel ratio ${dpr})`);
@@ -91,9 +111,7 @@ export async function bootstrap(): Promise<void> {
   (app.renderer as any).roundPixels = false;
   stageEl.appendChild(canvas);
 
-  const character = new Character(app, {
-    onTap: (areas) => handleTap(areas),
-  });
+  const character = new Character(app);
 
   // ---------------------------------------------------------------- model
   const models = await api.listModels();
@@ -124,7 +142,26 @@ export async function bootstrap(): Promise<void> {
 
   character.userScale = config.scale;
   character.applyScale();
-  app.ticker.add(() => character.tick());
+
+  // ---------------------------------------------------------------- outfits
+  // The list of outfits is fixed, the backend tells which of them have their
+  // artwork in the assets folder.
+  let outfitOptions = mergeOutfits(
+    await api.listOutfits(entry.file).catch((error) => {
+      log(`the outfits could not be read: ${error}`);
+      return [];
+    }),
+  );
+  log(
+    `outfits: ${outfitOptions
+      .map((option) => `${option.id}${option.available ? "" : " (missing)"}`)
+      .join(", ")}`,
+  );
+  // The mouth is animated on its own clock, the text stream never touches it.
+  app.ticker.add(() => character.tick(app.ticker.deltaMS));
+  // The mask is refreshed after the frame was drawn: the extra render then
+  // shows exactly what is on the screen and cannot interrupt the frame.
+  app.ticker.add(() => character.updateMask(), undefined, UPDATE_PRIORITY.UTILITY);
   app.renderer.on("resize", () => {
     character.applyScale();
     layoutBubble();
@@ -150,7 +187,7 @@ export async function bootstrap(): Promise<void> {
     const maxX = window.innerWidth - 8 - width / 2;
     const x = Math.min(Math.max(anchor.x, minX), Math.max(minX, maxX));
     bubbleEl.style.left = `${Math.round(x)}px`;
-    bubbleEl.style.top = `${top}px`;
+    bubbleEl.style.top = `${Math.round(top)}px`;
     bubbleEl.style.transform = "translateX(-50%)";
   }
 
@@ -158,10 +195,15 @@ export async function bootstrap(): Promise<void> {
     if (chatEl.hidden) return;
     const anchor = character.headAnchor();
     const gap = 12;
-    // Keep the whole panel inside the window while its bottom edge rests
-    // just above her head.
-    const available = Math.max(100, Math.round(anchor.y - gap - 6));
-    chatEl.style.maxHeight = `${available}px`;
+    // Keep the whole panel inside of the window while its bottom edge rests
+    // just above her head. A panel that was made smaller by hand keeps its
+    // size, only a panel that does not fit is cut off.
+    const available = Math.max(80, Math.round(anchor.y - gap - 6));
+    if (chatEl.offsetHeight > available) {
+      chatEl.style.maxHeight = `${available}px`;
+    } else {
+      chatEl.style.maxHeight = "";
+    }
     const width = chatEl.offsetWidth;
     const height = chatEl.offsetHeight;
     const top = Math.max(6 + height, Math.round(anchor.y - gap));
@@ -169,7 +211,7 @@ export async function bootstrap(): Promise<void> {
     const maxX = window.innerWidth - 8 - width / 2;
     const x = Math.min(Math.max(anchor.x, minX), Math.max(minX, maxX));
     chatEl.style.left = `${Math.round(x)}px`;
-    chatEl.style.top = `${top}px`;
+    chatEl.style.top = `${Math.round(top)}px`;
     chatEl.style.transform = "translate(-50%, -100%)";
   }
 
@@ -201,7 +243,11 @@ export async function bootstrap(): Promise<void> {
    */
   async function makeWindowInert(): Promise<void> {
     try {
-      await api.setPassthrough(true);
+      if (nativeHitTest) {
+        await api.setHitEnabled(false);
+      } else {
+        await api.setPassthrough(true);
+      }
     } catch {
       /* not critical */
     }
@@ -215,6 +261,12 @@ export async function bootstrap(): Promise<void> {
     chatLog.scrollTop = chatLog.scrollHeight;
   }
 
+  /** The small line under the name tells how the connection looks. */
+  function setChatStatus(text: string, isError = false): void {
+    chatStatus.textContent = text;
+    chatStatus.classList.toggle("error", isError);
+  }
+
   function toggleChat(force?: boolean): void {
     const show = force ?? chatEl.hidden;
     chatEl.hidden = !show;
@@ -224,15 +276,22 @@ export async function bootstrap(): Promise<void> {
       layoutChat();
       chatInput.focus();
     }
+    // The panel changes the height of the overlay.
+    void applyAutoSize();
+    void pushUiRects();
   }
 
   // ---------------------------------------------------------------- chat
   const chat = new Chat(config, {
+    // The tokens only fill the bubble. They must not touch the animation:
+    // the mouth moves on its own clock, so she keeps a steady pose while she
+    // is talking.
     onDelta: (text) => {
-      character.setMouthOpen(0.75);
+      character.startTalking();
       showBubble(text, Math.max(4, config.bubbleSeconds));
     },
     onDone: (full) => {
+      character.stopTalking();
       if (full.trim()) {
         logMessage(full.trim(), "her");
         showBubble(full.trim(), Math.max(4, config.bubbleSeconds));
@@ -240,7 +299,9 @@ export async function bootstrap(): Promise<void> {
       void api.setConfig(config);
     },
     onError: (message) => {
+      character.stopTalking();
       logMessage(`[error] ${message}`, "system");
+      setChatStatus(`offline · ${message}`, true);
       showToast(message);
     },
   });
@@ -270,19 +331,24 @@ export async function bootstrap(): Promise<void> {
   let menuOpen = false;
 
   function closeMenu(): void {
-    if (!menuOpen) return;
+    if (!menuOpen && outfitPanel.hidden) return;
     menuOpen = false;
     menuEl.hidden = true;
+    outfitPanel.hidden = true;
+    void pushUiRects();
   }
 
   function openMenu(x: number, y: number): void {
     menuOpen = true;
     menuEl.hidden = false;
+    // A fresh menu always starts without the outfit panel.
+    outfitPanel.hidden = true;
     // Keep the menu inside of the window.
     const maxX = Math.max(4, window.innerWidth - menuEl.offsetWidth - 4);
     const maxY = Math.max(4, window.innerHeight - menuEl.offsetHeight - 4);
     menuEl.style.left = `${Math.round(Math.min(Math.max(4, x), maxX))}px`;
     menuEl.style.top = `${Math.round(Math.min(Math.max(4, y), maxY))}px`;
+    void pushUiRects();
   }
 
   menuHide.addEventListener("click", async () => {
@@ -296,38 +362,199 @@ export async function bootstrap(): Promise<void> {
     toggleChat(true);
   });
 
+  menuOutfit.addEventListener("click", () => {
+    if (outfitPanel.hidden) {
+      openOutfitPanel();
+    } else {
+      closeMenu();
+    }
+  });
+
+  menuSize.addEventListener("click", () => {
+    closeMenu();
+    // The size was set by hand, this gives the automatic size back.
+    config.windowHeight = 0;
+    void applyAutoSize();
+    void api.setConfig(config);
+  });
+
   menuQuit.addEventListener("click", () => {
     closeMenu();
     void api.quitApp();
   });
 
-  canvas.addEventListener("contextmenu", (event) => {
-    // The webview would show its own menu, which is not what we want here.
-    event.preventDefault();
-    openMenu(event.clientX, event.clientY);
-  });
+  // ---------------------------------------------------------------- outfits
+  /**
+   * Opens the list of outfits next to the context menu.
+   *
+   * The list is a panel of its own, so it can be longer than the menu and it
+   * scrolls when there are many outfits.
+   */
+  function openOutfitPanel(): void {
+    buildOutfitList();
+    outfitPanel.hidden = false;
 
-  // A click somewhere else closes the menu again.
-  window.addEventListener("pointerdown", (event) => {
-    if (!menuOpen) return;
-    const target = event.target as Node | null;
-    if (target && menuEl.contains(target)) return;
-    closeMenu();
-  });
+    // New artwork may have been dropped in while the app was running.
+    void refreshOutfits();
+
+    const menuBox = menuEl.getBoundingClientRect();
+    const width = outfitPanel.offsetWidth;
+    const height = outfitPanel.offsetHeight;
+
+    // Next to the menu, but flipped to the left when there is no room.
+    let left = menuBox.right + 6;
+    if (left + width > window.innerWidth - 4) {
+      left = menuBox.left - width - 6;
+    }
+    left = Math.min(Math.max(4, left), Math.max(4, window.innerWidth - width - 4));
+
+    let top = menuBox.top;
+    if (top + height > window.innerHeight - 4) {
+      top = Math.max(4, window.innerHeight - height - 4);
+    }
+
+    outfitPanel.style.left = `${Math.round(left)}px`;
+    outfitPanel.style.top = `${Math.round(top)}px`;
+    void pushUiRects();
+  }
+
+  /**
+   * Reads the outfits again.
+   *
+   * The assets folder can change while the app runs - artwork that was
+   * dropped in has to show up without a restart. The list is only rebuilt
+   * when something really changed, so the panel does not flicker.
+   */
+  async function refreshOutfits(): Promise<void> {
+    const found = await api.listOutfits(entry.file).catch((error) => {
+      log(`the outfits could not be read: ${error}`);
+      return null;
+    });
+    if (!found) return;
+
+    const options = mergeOutfits(found);
+    const same =
+      options.length === outfitOptions.length &&
+      options.every(
+        (option, index) =>
+          option.id === outfitOptions[index].id &&
+          option.available === outfitOptions[index].available,
+      );
+    if (same) return;
+
+    outfitOptions = options;
+    buildOutfitList();
+    log(
+      `outfits: ${options
+        .map((option) => `${option.id}${option.available ? "" : " (missing)"}`)
+        .join(", ")}`,
+    );
+  }
+
+  /** Fills the panel with the outfits, grouped by their category. */
+  function buildOutfitList(): void {
+    outfitList.replaceChildren();
+
+    for (const group of groupOutfits(outfitOptions)) {
+      const header = document.createElement("div");
+      header.className = "outfit-group";
+      header.textContent = group.category;
+      outfitList.appendChild(header);
+
+      for (const option of group.items) {
+        const button = document.createElement("button");
+        button.type = "button";
+        button.className = "outfit-item";
+        if (option.id === config.selectedOutfit) {
+          button.classList.add("selected");
+        }
+        if (!option.available) {
+          button.classList.add("missing");
+        }
+        button.title = option.available
+          ? option.label
+          : `${option.label} - ${option.problem || "no artwork yet"}`;
+
+        const label = document.createElement("span");
+        label.textContent = option.label;
+        button.appendChild(label);
+
+        const check = document.createElement("span");
+        check.className = "outfit-check";
+        check.textContent = option.id === config.selectedOutfit ? "✓" : "";
+        button.appendChild(check);
+
+        button.addEventListener("click", () => {
+          closeMenu();
+          void applyOutfit(option.id);
+        });
+
+        outfitList.appendChild(button);
+      }
+    }
+  }
+
+  /**
+   * Puts an outfit on her and remembers it.
+   *
+   * An outfit whose artwork is missing - or that does not fit the model -
+   * falls back to the default outfit, so the character is never left with a
+   * broken texture.
+   */
+  async function applyOutfit(id: string, quiet = false): Promise<void> {
+    const wanted = outfitOptions.find((option) => option.id === id);
+    if (!wanted) return;
+    const fallback =
+      outfitOptions.find((option) => option.id === DEFAULT_OUTFIT) ?? wanted;
+
+    let target = wanted;
+    if (!wanted.available) {
+      if (!quiet) {
+        showToast(
+          `${wanted.label}: ${wanted.problem || "no artwork"} - keeping the default outfit.`,
+        );
+      }
+      log(`outfit ${wanted.id} is not available: ${wanted.problem}`);
+      target = fallback;
+    }
+
+    let ok = true;
+    if (target.id === DEFAULT_OUTFIT) {
+      ok = await character.setOutfit(null, base);
+    } else {
+      ok = await character.setOutfit(target, base);
+    }
+    if (!ok) {
+      showToast(`Could not wear the ${target.label} - keeping the default outfit.`);
+      target = fallback;
+      await character.setOutfit(null, base);
+    }
+
+    if (config.selectedOutfit !== target.id) {
+      config.selectedOutfit = target.id;
+      await api.setConfig(config);
+    }
+    log(`outfit: ${target.id}`);
+  }
 
   // ---------------------------------------------------------------- tapping
+  /**
+   * A tap is answered with a reaction: a motion, an expression and a line.
+   *
+   * The motion and the expression are rate limited inside the character, so
+   * a single click can never restart a motion that is still playing. That
+   * restart was the reason she was jumping between the poses.
+   */
   function handleTap(areas: string[]): void {
     const lower = areas.map((a) => a.toLowerCase());
 
     if (lower.some((a) => a.includes("head"))) {
-      character.motion("TapBody", 0, 3);
-      character.expression("F05");
+      character.react("TapBody", "F05", 0);
       const line = pick(HEAD_REACTIONS);
       chat.say(line);
       showBubble(line);
     } else if (lower.some((a) => a.includes("body"))) {
-      character.motion("TapBody", 1, 3);
-      character.expression("F03");
+      character.react("TapBody", "F03", 1);
       const line = pick(BODY_REACTIONS);
       chat.say(line);
       showBubble(line);
@@ -339,14 +566,38 @@ export async function bootstrap(): Promise<void> {
   }
 
   // ---------------------------------------------------------------- pointer
+  // The canvas itself does not take any mouse events. Everything is decided
+  // against the silhouette of the character, so an empty area of the overlay
+  // belongs to the desktop underneath it.
   let pointerDown = false;
   let pointerMoved = false;
   let dragOrigin = { x: 0, y: 0 };
   let windowOrigin = { x: 0, y: 0 };
   let dragging = false;
 
-  canvas.addEventListener("pointerdown", async (event) => {
+  /** True when the point is on the character. */
+  function overCharacter(x: number, y: number): boolean {
+    return character.isOpaqueAt(x, y);
+  }
+
+  /** True when the point is on one of the interactive panels. */
+  function overUi(x: number, y: number): boolean {
+    return uiRects().some(
+      (r) => x >= r.x && y >= r.y && x <= r.x + r.w && y <= r.y + r.h,
+    );
+  }
+
+  window.addEventListener("pointerdown", async (event) => {
     if (event.button !== 0) return;
+    const x = event.clientX;
+    const y = event.clientY;
+
+    // A click outside of the character closes the menu again.
+    if (menuOpen && !overUi(x, y)) {
+      closeMenu();
+    }
+    if (overUi(x, y)) return;
+    if (!overCharacter(x, y)) return;
 
     // The drag origin has to be known *before* the button is considered down,
     // otherwise the poll loop can start dragging the window with stale values
@@ -359,68 +610,148 @@ export async function bootstrap(): Promise<void> {
     pointerDown = true;
     pointerMoved = false;
     dragging = false;
-    log(`pointerdown at ${event.clientX.toFixed(0)},${event.clientY.toFixed(0)}`);
+    log(`pointerdown at ${x.toFixed(0)},${y.toFixed(0)}`);
 
-    try {
-      canvas.setPointerCapture(event.pointerId);
-    } catch {
-      /* capture is optional */
-    }
+    // While the window is dragged the mouse belongs to the window, even when
+    // it is not exactly over the character.
+    await setHitForce(true);
   });
 
-  canvas.addEventListener("pointermove", (event) => {
+  window.addEventListener("pointermove", (event) => {
     if (!pointerDown) return;
     if (Math.abs(event.movementX) > 1 || Math.abs(event.movementY) > 1) {
       pointerMoved = true;
     }
   });
 
-  canvas.addEventListener("pointerup", async (event) => {
+  window.addEventListener("pointerup", async (event) => {
+    if (!pointerDown) return;
     pointerDown = false;
-    try {
-      canvas.releasePointerCapture(event.pointerId);
-    } catch {
-      /* ignore */
-    }
+    dragging = false;
+    await setHitForce(false);
 
     if (!pointerMoved) {
-      const rect = canvas.getBoundingClientRect();
-      const areas = character.hitTest(event.clientX - rect.left, event.clientY - rect.top);
+      const areas = character.hitTest(event.clientX, event.clientY);
       handleTap(areas);
     }
   });
 
-  canvas.addEventListener("dblclick", () => toggleChat());
+  window.addEventListener("dblclick", (event) => {
+    if (overUi(event.clientX, event.clientY)) return;
+    if (!overCharacter(event.clientX, event.clientY)) return;
+    toggleChat();
+  });
 
-  canvas.addEventListener(
+  window.addEventListener(
     "wheel",
     (event) => {
+      if (overUi(event.clientX, event.clientY)) return;
+      if (!overCharacter(event.clientX, event.clientY)) return;
       event.preventDefault();
       const factor = event.deltaY > 0 ? 0.92 : 1.08;
-      config.scale = clamp(config.scale * factor, 0.55, 4.5);
+      config.scale = clamp(config.scale * factor, 0.4, 2.5);
       character.userScale = config.scale;
       character.applyScale();
       layoutBubble();
       layoutChat();
+      void applyAutoSize();
       void api.setConfig(config);
     },
     { passive: false },
   );
 
-  // ---------------------------------------------------------------- hit testing
-  // The window is never clipped. WebView2 renders the character with a full
-  // 8-bit alpha channel and DWM blends it per pixel with the desktop, so the
-  // soft anti-aliased edge of the artwork is preserved. Only mouse handling is
-  // gated: when the cursor is not over an opaque model pixel or a UI panel the
-  // window becomes WS_EX_TRANSPARENT, so the click falls through to whatever
-  // is below it. Hit-testing uses the same alpha mask the old window region
-  // was built from, but it no longer affects what is drawn.
-  let passthrough = false;
-  let interactive = false;
+  window.addEventListener("contextmenu", (event) => {
+    // The webview would show its own menu, which is not what we want here.
+    event.preventDefault();
+    if (overUi(event.clientX, event.clientY)) return;
+    if (!overCharacter(event.clientX, event.clientY)) return;
+    openMenu(event.clientX, event.clientY);
+  });
+
+  // ---------------------------------------------------------------- resizing
+  // The grip in the corner resizes the whole overlay. The window follows the
+  // mouse, the character scales with the width of it.
+  let resizing = false;
+  let resizeStart = { x: 0, y: 0, width: 0, height: 0 };
+
+  gripEl.addEventListener("pointerdown", async (event) => {
+    event.preventDefault();
+    event.stopPropagation();
+    const bounds = await api.windowBounds();
+    const factor = bounds.scaleFactor || 1;
+    resizeStart = {
+      x: event.screenX,
+      y: event.screenY,
+      width: bounds.width / factor,
+      height: bounds.height / factor,
+    };
+    resizing = true;
+    await setHitForce(true);
+    try {
+      gripEl.setPointerCapture(event.pointerId);
+    } catch {
+      /* capture is optional */
+    }
+  });
+
+  gripEl.addEventListener("pointermove", (event) => {
+    if (!resizing) return;
+    const width = clamp(
+      resizeStart.width + (event.screenX - resizeStart.x),
+      MIN_WIDTH,
+      900,
+    );
+    const height = clamp(
+      resizeStart.height + (event.screenY - resizeStart.y),
+      MIN_HEIGHT,
+      900,
+    );
+    config.windowWidth = Math.round(width);
+    config.windowHeight = Math.round(height);
+    // The corner follows the mouse, so the top left corner stays in place.
+    void api.setWindowSize(width, height, false);
+  });
+
+  const endResize = async (): Promise<void> => {
+    if (!resizing) return;
+    resizing = false;
+    await setHitForce(false);
+    void api.setConfig(config);
+    log(`overlay resized to ${config.windowWidth}x${config.windowHeight}`);
+  };
+
+  gripEl.addEventListener("pointerup", () => void endResize());
+  gripEl.addEventListener("pointercancel", () => void endResize());
+
+  // The overlay is only as tall as the character and the chat need. The
+  // bottom edge stays where it is, so she does not jump when the chat panel
+  // is opened.
+  function desiredHeight(): number {
+    const sprite = character.spriteHeight();
+    if (sprite <= 0) return 0;
+    const chatSpace = chatEl.hidden ? 0 : chatEl.offsetHeight + 12;
+    const bubbleSpace = chatEl.hidden ? BUBBLE_SPACE : 0;
+    return Math.round(sprite + 8 + chatSpace + bubbleSpace);
+  }
+
+  async function applyAutoSize(): Promise<void> {
+    if (config.windowHeight > 0) return; // the user picked a size
+    const height = desiredHeight();
+    if (height <= 0) return;
+    const width = config.windowWidth || window.innerWidth;
+    await api.setWindowSize(width, height, true);
+  }
+
+  // ---------------------------------------------------------------- hit test
+  // The window itself decides where a click belongs to. The webview hands
+  // over the silhouette of the character and the rectangles of the panels,
+  // the native side answers with "mine" or "yours" for every single pixel.
+  let lastHitMapAt = 0;
+  let lastRectSignature = "";
 
   function uiRects(): Rect[] {
     const rects: Rect[] = [];
-    for (const el of [chatEl, bubbleEl, toastEl, menuEl]) {
+    for (const el of [chatEl, menuEl, outfitPanel, gripEl]) {
       if (el.hidden) continue;
       const box = el.getBoundingClientRect();
       if (box.width < 1 || box.height < 1) continue;
@@ -434,11 +765,51 @@ export async function bootstrap(): Promise<void> {
     return rects;
   }
 
-  function isOverUi(x: number, y: number): boolean {
-    return uiRects().some(
-      (r) => x >= r.x && y >= r.y && x <= r.x + r.w && y <= r.y + r.h,
-    );
+  async function pushUiRects(): Promise<void> {
+    if (!nativeHitTest) return;
+    const rects = uiRects();
+    const signature = rects
+      .map((r) => `${r.x},${r.y},${r.w},${r.h}`)
+      .join("|");
+    if (signature === lastRectSignature) return;
+    lastRectSignature = signature;
+    try {
+      await api.setUiRects(rects);
+    } catch (error) {
+      console.error("could not update the ui rectangles", error);
+    }
   }
+
+  async function pushHitMap(): Promise<void> {
+    if (!nativeHitTest) return;
+    const map = character.hitMap(2);
+    if (!map) return;
+    const bounds = await api.windowBounds();
+    try {
+      await api.setHitMap(
+        map.bits,
+        map.cols,
+        map.rows,
+        map.cell,
+        bounds.scaleFactor || 1,
+      );
+    } catch (error) {
+      console.error("could not update the hit map", error);
+    }
+  }
+
+  async function setHitForce(force: boolean): Promise<void> {
+    if (!nativeHitTest) return;
+    try {
+      await api.setHitForce(force);
+    } catch {
+      /* not critical */
+    }
+  }
+
+  // The old fallback: the whole window is click-through while the cursor is
+  // not over the character.
+  let passthrough = false;
 
   async function setPassthrough(next: boolean): Promise<void> {
     if (next === passthrough) return;
@@ -475,7 +846,6 @@ export async function bootstrap(): Promise<void> {
 
       if (dragging) {
         // The button is held, so the window must stay interactive.
-        await setPassthrough(false);
         await api.setWindowPosition(
           windowOrigin.x + (cursor.x - dragOrigin.x),
           windowOrigin.y + (cursor.y - dragOrigin.y),
@@ -488,9 +858,9 @@ export async function bootstrap(): Promise<void> {
 
       character.focus(sx, sy);
 
-      if (!pointerDown) {
-        const active = !config.clickThrough || isOverUi(sx, sy) || character.isOpaqueAt(sx, sy);
-        interactive = active;
+      if (!nativeHitTest && !pointerDown) {
+        const active =
+          !config.clickThrough || overUi(sx, sy) || overCharacter(sx, sy);
         await setPassthrough(!active);
       }
 
@@ -507,6 +877,12 @@ export async function bootstrap(): Promise<void> {
         layoutChat();
       }
 
+      if (nativeHitTest && now - lastHitMapAt > HIT_MAP_INTERVAL) {
+        lastHitMapAt = now;
+        await pushHitMap();
+        await pushUiRects();
+      }
+
       if (now - lastVisibleCheck > 1000) {
         lastVisibleCheck = now;
         const visible = await api.windowVisible();
@@ -517,7 +893,6 @@ export async function bootstrap(): Promise<void> {
             app.ticker.start();
           } else {
             app.ticker.stop();
-            await setPassthrough(true);
           }
         }
       }
@@ -527,15 +902,28 @@ export async function bootstrap(): Promise<void> {
   }, POLL_INTERVAL);
 
   // ---------------------------------------------------------------- startup
+  if (nativeHitTest) {
+    await api.setHitEnabled(config.clickThrough);
+  }
+
+  // She wears the outfit of the last session. An outfit whose artwork is gone
+  // falls back to the default one.
+  await applyOutfit(config.selectedOutfit || DEFAULT_OUTFIT, true);
+
+  // The overlay starts with the size it had last time, or with the size the
+  // character needs.
+  if (config.windowWidth > 0) {
+    await api.setWindowSize(config.windowWidth, config.windowHeight || 720, true);
+  }
+  await applyAutoSize();
+
   const backend = await api.detectBackend();
   log("backend detected", backend);
   if (backend.error) {
     showToast(backend.error);
+    setChatStatus(`offline · ${backend.error}`, true);
   } else {
-    logMessage(
-      `Connected to ${backend.provider} (${backend.activeModel})`,
-      "system",
-    );
+    setChatStatus(`connected · ${backend.provider} · ${backend.activeModel}`);
   }
 
   if (config.greetOnStart) {
@@ -546,13 +934,19 @@ export async function bootstrap(): Promise<void> {
 
   // A heartbeat makes it easy to see from the log that the render loop and
   // the model are still alive.
-  window.setInterval(() => {
+  window.setInterval(async () => {
     const ratio = character.maskPixels
       ? (character.opaquePixels / character.maskPixels) * 100
       : 0;
     const model = character.model;
+    const stats = nativeHitTest
+      ? await api.hitTestStats().catch(() => null)
+      : null;
+    const hit = stats
+      ? `native calls=${stats.calls} client=${stats.client} through=${stats.transparent} last=${stats.lastX.toFixed(0)},${stats.lastY.toFixed(0)}=>${stats.lastResult} fresh=${stats.fresh} maps=${stats.mapUpdates}`
+      : "window";
     log(
-      `heartbeat: fps=${app.ticker.FPS.toFixed(0)} opaque=${character.opaquePixels}/${character.maskPixels} (${ratio.toFixed(1)}%) mouse=${interactive ? "interactive" : "through"} model=${model ? `${model.scale.x.toFixed(3)}@${model.position.x.toFixed(0)},${model.position.y.toFixed(0)}` : "none"}`,
+      `heartbeat: fps=${app.ticker.FPS.toFixed(0)} opaque=${character.opaquePixels}/${character.maskPixels} (${ratio.toFixed(1)}%) model=${model ? `${model.scale.x.toFixed(3)}@${model.position.x.toFixed(0)},${model.position.y.toFixed(0)}` : "none"} window=${window.innerWidth}x${window.innerHeight} hit=${hit} anim=${character.animationState()}`,
     );
   }, 5000);
 

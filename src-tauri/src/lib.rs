@@ -20,6 +20,11 @@ const MAIN_WINDOW_TITLE: &str = "Ei Waifu";
 /// Name of the mutex that keeps a second instance from starting.
 const SINGLE_INSTANCE_MUTEX: &str = r"Local\EiWaifuSingleInstance";
 
+/// The outfit every character starts with.
+fn default_outfit() -> String {
+    "default".into()
+}
+
 #[derive(Serialize, Deserialize, Clone, Debug)]
 #[serde(rename_all = "camelCase")]
 pub struct AppConfig {
@@ -37,8 +42,15 @@ pub struct AppConfig {
     pub always_on_top: bool,
     pub click_through: bool,
     pub selected_model: String,
+    /// The outfit she is wearing, e.g. "default" or "bunny".
+    #[serde(default = "default_outfit")]
+    pub selected_outfit: String,
     pub bubble_seconds: f64,
     pub greet_on_start: bool,
+    /// Width of the overlay in css pixels.
+    pub window_width: f64,
+    /// Height of the overlay in css pixels. `0` means "as tall as needed".
+    pub window_height: f64,
 }
 
 impl Default for AppConfig {
@@ -47,8 +59,8 @@ impl Default for AppConfig {
             persona_name: "Aria".into(),
             user_name: "you".into(),
             personality: "warm, playful and a little teasing. genuinely curious about the user's day".into(),
-            llm_provider: "auto".into(),
-            llm_model: String::new(),
+            llm_provider: "ollama".into(),
+            llm_model: "qwen2.5:1.5b".into(),
             ollama_base_url: "http://localhost:11434".into(),
             lmstudio_base_url: "http://localhost:1234".into(),
             temperature: 0.9,
@@ -57,8 +69,11 @@ impl Default for AppConfig {
             always_on_top: true,
             click_through: true,
             selected_model: String::new(),
+            selected_outfit: "default".into(),
             bubble_seconds: 7.0,
             greet_on_start: true,
+            window_width: 420.0,
+            window_height: 0.0,
         }
     }
 }
@@ -102,7 +117,11 @@ fn load_config(app: &AppHandle) -> AppConfig {
     let mut cfg = AppConfig::default();
     if let Some(path) = config_path(app) {
         if let Ok(text) = fs::read_to_string(&path) {
-            if let Ok(parsed) = serde_json::from_str::<AppConfig>(&text) {
+            // A config that was written by an editor with a byte order mark
+            // would not parse, and the app would silently fall back to the
+            // defaults. The mark is dropped before parsing.
+            let text = text.trim_start_matches('\u{feff}');
+            if let Ok(parsed) = serde_json::from_str::<AppConfig>(text) {
                 cfg = parsed;
             }
         }
@@ -119,24 +138,35 @@ fn save_config(app: &AppHandle, cfg: &AppConfig) -> Result<(), String> {
     fs::write(path, text).map_err(|e| e.to_string())
 }
 
-fn models_root(app: &AppHandle) -> PathBuf {
+/// The root of everything the webview loads. The models and the character
+/// assets live in folders below it, and the loopback server serves exactly
+/// this folder.
+fn server_root(app: &AppHandle) -> PathBuf {
     if cfg!(debug_assertions) {
         PathBuf::from(env!("CARGO_MANIFEST_DIR"))
             .parent()
-            .map(|p| p.join("models"))
-            .unwrap_or_else(|| PathBuf::from("models"))
+            .map(|p| p.to_path_buf())
+            .unwrap_or_else(|| PathBuf::from("."))
     } else {
         app.path()
             .app_data_dir()
-            .map(|d| d.join("models"))
-            .unwrap_or_else(|_| PathBuf::from("models"))
+            .unwrap_or_else(|_| PathBuf::from("."))
     }
 }
 
-/// Folders that may hold the bundled Live2D models. They are used to seed
-/// the models directory in the app data folder, so the app also finds its
-/// models when it is started straight from the build folder.
-fn model_sources(app: &AppHandle) -> Vec<PathBuf> {
+fn models_root(app: &AppHandle) -> PathBuf {
+    server_root(app).join("models")
+}
+
+/// The character assets: `assets/characters/<name>/base` and `.../outfits`.
+fn assets_root(app: &AppHandle) -> PathBuf {
+    server_root(app).join("assets")
+}
+
+/// Folders that may hold the bundled "models" or "assets" trees. They are
+/// used to seed those directories in the app data folder, so the app also
+/// finds them when it is started straight from the build folder.
+fn bundled_sources(app: &AppHandle, folder: &str) -> Vec<PathBuf> {
     let mut out: Vec<PathBuf> = Vec::new();
     let mut push = |path: PathBuf| {
         if !out.contains(&path) {
@@ -148,32 +178,31 @@ fn model_sources(app: &AppHandle) -> Vec<PathBuf> {
         push(
             PathBuf::from(env!("CARGO_MANIFEST_DIR"))
                 .join("..")
-                .join("models"),
+                .join(folder),
         );
     }
 
     // installed app: the resources sit next to the executable
     if let Ok(res) = app.path().resource_dir() {
-        push(res.join("models"));
+        push(res.join(folder));
     }
 
     if let Ok(exe) = std::env::current_exe() {
         if let Some(dir) = exe.parent() {
-            push(dir.join("models"));
-            push(dir.join("resources").join("models"));
-            // <project>\src-tauri\target\release\ei-waifu.exe -> <project>\models
-            push(dir.join("..").join("..").join("models"));
-            push(dir.join("..").join("..").join("..").join("models"));
+            push(dir.join(folder));
+            push(dir.join("resources").join(folder));
+            // <project>\src-tauri\target\release\ei-waifu.exe -> <project>\<folder>
+            push(dir.join("..").join("..").join(folder));
+            push(dir.join("..").join("..").join("..").join(folder));
         }
     }
 
     out
 }
 
-/// Creates the models directory and seeds it with the bundled models when it
-/// is still empty.
-fn ensure_models_dir(app: &AppHandle) -> PathBuf {
-    let dir = models_root(app);
+/// Creates a directory and seeds it with the bundled files when it is still
+/// empty.
+fn ensure_dir_with_sources(dir: PathBuf, sources: Vec<PathBuf>) -> PathBuf {
     if !dir.exists() {
         let _ = fs::create_dir_all(&dir);
     }
@@ -185,7 +214,7 @@ fn ensure_models_dir(app: &AppHandle) -> PathBuf {
         .map(|mut d| d.next().is_none())
         .unwrap_or(true);
     if empty {
-        for src in model_sources(app) {
+        for src in sources {
             if src == dir || !src.is_dir() {
                 continue;
             }
@@ -195,6 +224,18 @@ fn ensure_models_dir(app: &AppHandle) -> PathBuf {
         }
     }
     dir
+}
+
+/// Creates the models directory and seeds it with the bundled models when it
+/// is still empty.
+fn ensure_models_dir(app: &AppHandle) -> PathBuf {
+    ensure_dir_with_sources(models_root(app), bundled_sources(app, "models"))
+}
+
+/// Creates the character assets directory and seeds it with the bundled
+/// characters when it is still empty.
+fn ensure_assets_dir(app: &AppHandle) -> PathBuf {
+    ensure_dir_with_sources(assets_root(app), bundled_sources(app, "assets"))
 }
 
 fn copy_dir(src: &Path, dst: &Path) -> std::io::Result<()> {
@@ -287,50 +328,330 @@ fn set_config(app: AppHandle, state: State<'_, AppState>, config: AppConfig) -> 
     Ok(())
 }
 
+/// One texture of an outfit. It replaces the atlas with the same index.
+#[derive(Serialize, Clone, Debug)]
+#[serde(rename_all = "camelCase")]
+pub struct OutfitTexture {
+    /// The index of the atlas in the model.
+    pub index: u32,
+    /// The path of the file inside the outfit folder.
+    pub file: String,
+}
+
+/// One outfit of a character.
+#[derive(Serialize, Clone, Debug)]
+#[serde(rename_all = "camelCase")]
+pub struct OutfitEntry {
+    /// The id of the folder, e.g. "bunny".
+    pub id: String,
+    /// The name that is shown in the menu.
+    pub label: String,
+    /// The group the outfit is sorted into.
+    pub category: String,
+    /// The folder of the outfit, relative to the server root.
+    pub path: String,
+    /// The atlases this outfit replaces.
+    pub textures: Vec<OutfitTexture>,
+    /// False when the assets are missing or do not fit the model.
+    pub available: bool,
+    /// Why the outfit cannot be used.
+    pub problem: String,
+}
+
+/// The optional `outfit.json` of an outfit folder.
+#[derive(Deserialize, Default, Clone, Debug)]
+struct OutfitManifest {
+    label: Option<String>,
+    category: Option<String>,
+    #[serde(default)]
+    order: Option<i32>,
+}
+
+/// An atlas of the base model.
+struct BaseTexture {
+    /// The path of the atlas inside the model folder.
+    rel: String,
+    /// The plain file name, that is what an outfit has to provide.
+    name: String,
+    width: u32,
+    height: u32,
+}
+
+/// The atlases a Live2D model uses.
+fn model_textures(model_path: &Path) -> Vec<BaseTexture> {
+    let Ok(text) = fs::read_to_string(model_path) else {
+        return Vec::new();
+    };
+    let Ok(json) = serde_json::from_str::<serde_json::Value>(&text) else {
+        return Vec::new();
+    };
+
+    let entries: Vec<String> = if model_path.to_string_lossy().ends_with(".model3.json") {
+        json.get("FileReferences")
+            .and_then(|f| f.get("Textures"))
+            .and_then(|t| t.as_array())
+            .map(|a| {
+                a.iter()
+                    .filter_map(|v| v.as_str().map(|s| s.to_string()))
+                    .collect()
+            })
+            .unwrap_or_default()
+    } else {
+        // Cubism 2 keeps the textures at the top level.
+        json.get("textures")
+            .and_then(|t| t.as_array())
+            .map(|a| {
+                a.iter()
+                    .filter_map(|v| v.as_str().map(|s| s.to_string()))
+                    .collect()
+            })
+            .unwrap_or_default()
+    };
+
+    let dir = model_path.parent().unwrap_or(Path::new(""));
+    entries
+        .into_iter()
+        .map(|rel| {
+            let name = rel
+                .rsplit('/')
+                .next()
+                .unwrap_or(rel.as_str())
+                .to_string();
+            let (width, height) = png_size(&dir.join(&rel)).unwrap_or((0, 0));
+            BaseTexture {
+                rel,
+                name,
+                width,
+                height,
+            }
+        })
+        .collect()
+}
+
+/// The pixel size of a png, read from its header.
+fn png_size(path: &Path) -> Option<(u32, u32)> {
+    use std::io::Read;
+    let mut file = fs::File::open(path).ok()?;
+    let mut head = [0u8; 24];
+    file.read_exact(&mut head).ok()?;
+    if &head[..8] != b"\x89PNG\r\n\x1a\n" {
+        return None;
+    }
+    let width = u32::from_be_bytes([head[16], head[17], head[18], head[19]]);
+    let height = u32::from_be_bytes([head[20], head[21], head[22], head[23]]);
+    Some((width, height))
+}
+
+/// "smart_casual" -> "Smart Casual"
+fn pretty_name(id: &str) -> String {
+    id.split(['_', '-'])
+        .filter(|part| !part.is_empty())
+        .map(|part| {
+            let mut chars = part.chars();
+            match chars.next() {
+                Some(first) => first.to_uppercase().collect::<String>() + chars.as_str(),
+                None => String::new(),
+            }
+        })
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+/// The path of a folder relative to the server root, with forward slashes.
+fn relative_to(root: &Path, path: &Path) -> String {
+    let rest = path.strip_prefix(root).unwrap_or(path);
+    rest.components()
+        .filter_map(|c| match c {
+            std::path::Component::Normal(part) => Some(part.to_string_lossy().to_string()),
+            _ => None,
+        })
+        .collect::<Vec<_>>()
+        .join("/")
+}
+
+/// The outfits of the character that owns the given model.
+///
+/// The model file is given relative to the server root. A character folder
+/// may hold a "base" folder with the model and an "outfits" folder next to
+/// it, a plain model folder holds its outfits inside itself.
+#[tauri::command]
+fn list_outfits(app: AppHandle, model: String) -> Vec<OutfitEntry> {
+    let mut out: Vec<(i32, OutfitEntry)> = Vec::new();
+    let root = server_root(&app);
+    let model_path = root.join(&model);
+    let model_dir = model_path
+        .parent()
+        .map(|p| p.to_path_buf())
+        .unwrap_or_else(|| root.clone());
+
+    let character_dir = match model_dir.file_name().and_then(|n| n.to_str()) {
+        Some("base") => model_dir
+            .parent()
+            .map(|p| p.to_path_buf())
+            .unwrap_or_else(|| model_dir.clone()),
+        _ => model_dir.clone(),
+    };
+    let outfits_dir = character_dir.join("outfits");
+    let character_rel = relative_to(&root, &character_dir);
+
+    let base = model_textures(&model_path);
+    if base.is_empty() {
+        return Vec::new();
+    }
+
+    for folder in read_dirs(&outfits_dir) {
+        let id = file_name_of(&folder);
+        if id.is_empty() {
+            continue;
+        }
+
+        let manifest = fs::read_to_string(folder.join("outfit.json"))
+            .ok()
+            .and_then(|text| serde_json::from_str::<OutfitManifest>(&text).ok())
+            .unwrap_or_default();
+
+        let mut textures = Vec::new();
+        let mut problem = String::new();
+
+        for (index, atlas) in base.iter().enumerate() {
+            // The outfit may hold the atlas under its plain name or under
+            // the same path the model uses.
+            let candidates = [folder.join(&atlas.name), folder.join(&atlas.rel)];
+            let Some(file) = candidates.iter().find(|p| p.is_file()) else {
+                // The outfit does not replace this atlas, the base is kept.
+                continue;
+            };
+            let inside = file
+                .strip_prefix(&folder)
+                .map(|p| p.to_string_lossy().replace('\\', "/"))
+                .unwrap_or_else(|_| atlas.name.clone());
+
+            match png_size(file) {
+                Some((w, h)) if w == atlas.width && h == atlas.height => {
+                    textures.push(OutfitTexture {
+                        index: index as u32,
+                        file: inside,
+                    });
+                }
+                Some((w, h)) => {
+                    problem = format!(
+                        "{} is {}x{} but the model needs {}x{}",
+                        atlas.name, w, h, atlas.width, atlas.height
+                    );
+                }
+                None => {
+                    problem = format!("{} is not a readable png", atlas.name);
+                }
+            }
+        }
+
+        if textures.is_empty() && problem.is_empty() {
+            problem = "the texture atlases are missing".to_string();
+        }
+
+        out.push((
+            manifest.order.unwrap_or(99),
+            OutfitEntry {
+                label: manifest.label.unwrap_or_else(|| pretty_name(&id)),
+                category: manifest.category.unwrap_or_else(|| "Custom".into()),
+                path: format!("{}/outfits/{}", character_rel, id),
+                available: problem.is_empty(),
+                problem,
+                id,
+                textures,
+            },
+        ));
+    }
+
+    // The manifest may define the order of the outfits.
+    out.sort_by(|a, b| (a.0, &a.1.id).cmp(&(b.0, &b.1.id)));
+    out.into_iter().map(|(_, entry)| entry).collect()
+}
+
+/// The outfits of the character that owns the given model.
+#[tauri::command]
+fn assets_dir(app: AppHandle) -> String {
+    ensure_assets_dir(&app).to_string_lossy().to_string()
+}
+
 #[tauri::command]
 fn models_dir(app: AppHandle) -> String {
     ensure_models_dir(&app).to_string_lossy().to_string()
 }
 
+/// The folders inside a directory.
+fn read_dirs(dir: &Path) -> Vec<PathBuf> {
+    fs::read_dir(dir)
+        .map(|rd| {
+            rd.filter_map(|e| e.ok())
+                .map(|e| e.path())
+                .filter(|p| p.is_dir())
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// The files inside a directory.
+fn read_files(dir: &Path) -> Vec<PathBuf> {
+    fs::read_dir(dir)
+        .map(|rd| {
+            rd.filter_map(|e| e.ok())
+                .map(|e| e.path())
+                .filter(|p| p.is_file())
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+fn file_name_of(path: &Path) -> String {
+    path.file_name()
+        .map(|n| n.to_string_lossy().to_string())
+        .unwrap_or_default()
+}
+
+/// The kind and the file name of a Live2D model file.
+fn model_file(path: &Path) -> Option<(&'static str, String)> {
+    let name = file_name_of(path);
+    if name.ends_with(".model3.json") {
+        Some(("cubism4", name))
+    } else if name.ends_with(".model.json") {
+        Some(("cubism2", name))
+    } else {
+        None
+    }
+}
+
 #[tauri::command]
 fn list_models(app: AppHandle) -> Vec<ModelEntry> {
-    let dir = ensure_models_dir(&app);
     let mut out = Vec::new();
+    let _ = ensure_models_dir(&app);
+    let _ = ensure_assets_dir(&app);
 
-    let folders = match fs::read_dir(&dir) {
-        Ok(rd) => rd
-            .filter_map(|e| e.ok())
-            .map(|e| e.path())
-            .filter(|p| p.is_dir())
-            .collect::<Vec<_>>(),
-        Err(_) => return out,
-    };
+    // Plain models: models/<character>/<file>.model3.json
+    for folder in read_dirs(&models_root(&app)) {
+        let name = file_name_of(&folder);
+        for path in read_files(&folder) {
+            if let Some((kind, file)) = model_file(&path) {
+                out.push(ModelEntry {
+                    name: name.clone(),
+                    file: format!("models/{}/{}", name, file),
+                    kind: kind.into(),
+                });
+            }
+        }
+    }
 
-    for folder in folders {
-        let name = folder
-            .file_name()
-            .map(|n| n.to_string_lossy().to_string())
-            .unwrap_or_default();
-
-        let entries = match fs::read_dir(&folder) {
-            Ok(rd) => rd.filter_map(|e| e.ok()).map(|e| e.path()).collect::<Vec<_>>(),
-            Err(_) => continue,
-        };
-
-        for path in entries {
-            let file_name = path.file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or_default();
-            let (kind, file) = if file_name.ends_with(".model3.json") {
-                ("cubism4", file_name.clone())
-            } else if file_name.ends_with(".model.json") {
-                ("cubism2", file_name.clone())
-            } else {
-                continue;
-            };
-            out.push(ModelEntry {
-                name: name.clone(),
-                file: format!("{}/{}", name, file),
-                kind: kind.into(),
-            });
+    // Characters: assets/characters/<character>/base/<file>.model3.json
+    for folder in read_dirs(&assets_root(&app).join("characters")) {
+        let name = file_name_of(&folder);
+        for path in read_files(&folder.join("base")) {
+            if let Some((kind, file)) = model_file(&path) {
+                out.push(ModelEntry {
+                    name: name.clone(),
+                    file: format!("assets/characters/{}/base/{}", name, file),
+                    kind: kind.into(),
+                });
+            }
         }
     }
 
@@ -359,6 +680,55 @@ fn set_passthrough(app: AppHandle, ignore: bool) -> Result<(), String> {
     let hwnd = window_hwnd(&app).ok_or("window not available")?;
     win::set_click_through(hwnd, ignore);
     Ok(())
+}
+
+/// True when the native per pixel hit test is available. The webview uses it
+/// to decide between the native hit test and the old "make the whole window
+/// click-through" fallback.
+#[tauri::command]
+fn hit_test_available() -> bool {
+    win::hit_test_available()
+}
+
+/// The packed silhouette of the character, one bit per cell.
+#[tauri::command]
+fn set_hit_map(
+    bits: Vec<u8>,
+    cols: u32,
+    rows: u32,
+    cell: f64,
+    scale: f64,
+) -> Result<(), String> {
+    win::set_hit_map(bits, cols, rows, cell as f32, scale as f32);
+    Ok(())
+}
+
+/// The parts of the user interface that take the mouse.
+#[tauri::command]
+fn set_ui_rects(rects: Vec<win::UiRect>) -> Result<(), String> {
+    win::set_ui_rects(rects);
+    Ok(())
+}
+
+/// While forced the whole window reacts to the mouse. Used while the
+/// character is dragged or the window is resized.
+#[tauri::command]
+fn set_hit_force(force: bool) -> Result<(), String> {
+    win::set_hit_force(force);
+    Ok(())
+}
+
+/// Turns the click-through on or off.
+#[tauri::command]
+fn set_hit_enabled(enabled: bool) -> Result<(), String> {
+    win::set_hit_enabled(enabled);
+    Ok(())
+}
+
+/// A snapshot of the native hit test, used while debugging.
+#[tauri::command]
+fn hit_test_stats() -> win::HitStats {
+    win::hit_stats()
 }
 
 #[tauri::command]
@@ -396,6 +766,40 @@ fn set_window_position(app: AppHandle, x: i32, y: i32) -> Result<(), String> {
     window
         .set_position(tauri::PhysicalPosition::new(x, y))
         .map_err(|e| e.to_string())
+}
+
+/// Resizes the overlay.
+///
+/// `keep_bottom` keeps the lower edge of the window where it is and grows the
+/// window upwards. That is what the automatic size needs, so the character
+/// does not jump when the chat panel appears. When it is false the top left
+/// corner stays in place and the corner follows the mouse.
+#[tauri::command]
+fn set_window_size(
+    app: AppHandle,
+    width: f64,
+    height: f64,
+    keep_bottom: bool,
+) -> Result<(), String> {
+    let window = app.get_webview_window(MAIN_WINDOW).ok_or("no window")?;
+    let scale = window.scale_factor().unwrap_or(1.0);
+    let inner = window.inner_size().map_err(|e| e.to_string())?;
+    let position = window.outer_position().map_err(|e| e.to_string())?;
+    let new_height = (height * scale).round() as i32;
+    if keep_bottom {
+        let new_y = position.y + (inner.height as i32 - new_height);
+        window
+            .set_size(tauri::LogicalSize::new(width, height))
+            .map_err(|e| e.to_string())?;
+        window
+            .set_position(tauri::PhysicalPosition::new(position.x, new_y))
+            .map_err(|e| e.to_string())?;
+    } else {
+        window
+            .set_size(tauri::LogicalSize::new(width, height))
+            .map_err(|e| e.to_string())?;
+    }
+    Ok(())
 }
 
 #[tauri::command]
@@ -565,12 +969,21 @@ pub fn run() {
             set_config,
             log_line,
             models_dir,
+            assets_dir,
             list_models,
+            list_outfits,
             model_base_url,
             cursor_pos,
             set_passthrough,
+            hit_test_available,
+            set_hit_map,
+            set_ui_rects,
+            set_hit_force,
+            set_hit_enabled,
+            hit_test_stats,
             window_bounds,
             set_window_position,
+            set_window_size,
             set_always_on_top,
             toggle_window,
             set_window_visible,
@@ -590,6 +1003,18 @@ pub fn run() {
                 *state.config.lock().unwrap() = cfg.clone();
                 if let Some(window) = handle.get_webview_window(MAIN_WINDOW) {
                     let _ = window.set_always_on_top(cfg.always_on_top);
+                    // Restore the size of the overlay. A height of zero means
+                    // "as tall as the character and the chat need", the
+                    // webview calculates that once the model is loaded.
+                    if cfg.window_width > 0.0 {
+                        let height = if cfg.window_height > 0.0 {
+                            cfg.window_height
+                        } else {
+                            window.inner_size().map(|s| s.height as f64).unwrap_or(720.0)
+                                / window.scale_factor().unwrap_or(1.0)
+                        };
+                        let _ = window.set_size(tauri::LogicalSize::new(cfg.window_width, height));
+                    }
                 }
             }
 
@@ -599,13 +1024,19 @@ pub fn run() {
             #[cfg(target_os = "windows")]
             if let Some(hwnd) = window_hwnd(&handle) {
                 win::set_click_through(hwnd, false);
+                // The native hit test decides per pixel whether a click
+                // belongs to the character or to the desktop underneath.
+                if !win::install_hit_test(hwnd) {
+                    eprintln!("native hit test unavailable, falling back to the window wide click-through");
+                }
             }
 
-            let models = ensure_models_dir(&handle);
+            let _ = ensure_models_dir(&handle);
+            let _ = ensure_assets_dir(&handle);
 
-            // serve the models over loopback so the Live2D runtime can resolve
+            // serve the assets over loopback so the Live2D runtime can resolve
             // relative resources (moc3, textures, motions, ...) correctly.
-            match http::start(models) {
+            match http::start(server_root(&handle)) {
                 Ok(port) => {
                     handle
                         .state::<AppState>()

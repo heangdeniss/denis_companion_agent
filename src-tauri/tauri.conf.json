@@ -14,8 +14,8 @@
       {
         "label": "waifu",
         "title": "Ei Waifu",
-        "width": 460,
-        "height": 720,
+        "width": 420,
+        "height": 500,
         "resizable": false,
         "decorations": false,
         "transparent": true,
@@ -37,7 +37,7 @@
       "icons/128x128@2x.png",
       "icons/icon.ico"
     ],
-    "resources": ["../models/**/*"],
+    "resources": ["../assets/**/*"],
     "windows": {
       "webviewInstallMode": {
         "type": "downloadBootstrapper"

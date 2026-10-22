@@ -12,6 +12,17 @@
 }
 
 /* The overlay is frameless: no focus rings on the in-app controls. */
+html,
+body,
+*,
+*:before,
+*:after {
+  outline: none !important;
+  outline-width: 0 !important;
+  outline-style: none !important;
+  outline-color: transparent !important;
+}
+
 button:focus,
 button:focus-visible,
 input:focus,
@@ -26,6 +37,7 @@ input:focus-visible,
   outline: none !important;
   outline-width: 0 !important;
   outline-style: none !important;
+  outline-color: transparent !important;
 }
 
 html,
@@ -41,11 +53,14 @@ body {
   -webkit-user-select: none;
   user-select: none;
   cursor: default;
+  /* Allow clicks to pass through empty transparent areas */
+  pointer-events: none;
 }
 
 #stage {
   position: absolute;
   inset: 0;
+  pointer-events: none;
 }
 
 #stage canvas {
@@ -79,6 +94,8 @@ body {
   -webkit-backdrop-filter: none !important;
   animation: bubble-in 0.18s ease-out;
   z-index: 10;
+  /* The bubble is decoration only, clicks belong to the character below it. */
+  pointer-events: none;
 }
 
 .bubble[hidden] {
@@ -104,10 +121,10 @@ body {
   position: absolute;
   left: 50%;
   top: auto;
-  width: min(92%, 420px);
-  min-width: 240px;
-  max-width: 90vw;
-  min-height: 60px;
+  width: min(94%, 340px);
+  min-width: 210px;
+  max-width: 92vw;
+  min-height: 44px;
   max-height: 62vh;
   transform: translate(-50%, -100%);
   display: flex;
@@ -122,9 +139,11 @@ body {
   box-shadow: none !important;
   backdrop-filter: none !important;
   -webkit-backdrop-filter: none !important;
-  overflow: auto;
+  overflow: hidden;
   resize: both;
   z-index: 20;
+  /* The panel is real UI, so it takes the clicks. */
+  pointer-events: auto;
 }
 
 .chat[hidden] {
@@ -135,18 +154,45 @@ body {
   display: flex;
   align-items: center;
   justify-content: space-between;
-  padding: 7px 10px;
-  font-size: 12px;
-  letter-spacing: 0.04em;
+  gap: 8px;
+  padding: 7px 10px 3px;
+  font-size: 13px;
+  font-weight: 700;
+  letter-spacing: 0.08em;
   text-transform: uppercase;
   color: var(--accent);
+  flex: 0 0 auto;
+}
+
+/* The connection line is only a hint, it must not compete with the
+   conversation. */
+.chat-status {
+  padding: 0 10px 3px;
+  font-size: 10.5px;
+  line-height: 1.3;
+  letter-spacing: 0.01em;
+  color: var(--muted);
+  opacity: 0.72;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  flex: 0 0 auto;
+}
+
+.chat-status:empty {
+  display: none;
+}
+
+.chat-status.error {
+  color: #ff9db0;
+  opacity: 0.9;
 }
 
 .chat-close {
   background: none;
   border: none;
   color: var(--muted);
-  font-size: 17px;
+  font-size: 16px;
   line-height: 1;
   cursor: pointer;
   padding: 0 3px;
@@ -156,51 +202,139 @@ body {
   color: var(--accent-strong);
 }
 
+/* ---------------- message bubbles ---------------- */
+
 .chat-log {
   flex: 1 1 auto;
   overflow-y: auto;
-  padding: 9px 11px;
+  overscroll-behavior: contain;
+  padding: 4px 10px 6px;
   font-size: 12.5px;
-  line-height: 1.5;
+  line-height: 1.4;
   -webkit-user-select: text;
   user-select: text;
-  max-height: 260px;
+  min-height: 0;
+  /* The history stays small, the panel itself may be dragged bigger. */
+  max-height: 190px;
+  /* Slim scrollbars, the default ones are far too bulky for this panel. */
+  scrollbar-width: thin;
+  scrollbar-color: rgba(255, 255, 255, 0.16) transparent;
 }
 
+.chat-log::-webkit-scrollbar {
+  width: 4px;
+  height: 4px;
+}
+
+.chat-log::-webkit-scrollbar-track {
+  background: transparent;
+}
+
+.chat-log::-webkit-scrollbar-thumb {
+  background: rgba(255, 255, 255, 0.16);
+  border-radius: 4px;
+}
+
+.chat-log::-webkit-scrollbar-thumb:hover {
+  background: rgba(255, 255, 255, 0.3);
+}
+
+.chat-log::-webkit-scrollbar-corner {
+  background: transparent;
+}
+
+/* Every line is its own little bubble. */
 .chat-log .msg {
-  margin-bottom: 6px;
+  position: relative;
+  max-width: 88%;
+  margin-bottom: 5px;
+  padding: 6px 10px;
+  border-radius: 14px;
+  font-size: 12.5px;
+  line-height: 1.4;
   white-space: pre-wrap;
   word-break: break-word;
+  /* Aria speaks in a calm dark card. */
+  background: rgba(20, 20, 25, 0.75);
+  border: 1px solid rgba(255, 255, 255, 0.06);
+  backdrop-filter: blur(8px);
+  -webkit-backdrop-filter: blur(8px);
+  animation: msg-in 0.16s ease-out;
 }
 
+/* The user talks from the right, her own bubble is tinted. */
 .chat-log .msg.user {
-  color: var(--accent);
+  margin-left: auto;
+  background: rgba(255, 158, 199, 0.17);
+  border: 1px solid rgba(255, 158, 199, 0.3);
+  color: #ffe8f2;
+  border-bottom-right-radius: 5px;
 }
 
 .chat-log .msg.her {
-  color: var(--text);
+  margin-right: auto;
+  border-bottom-left-radius: 5px;
 }
 
+/* The little tail that points down towards her. */
+.chat-log .msg.her::after {
+  content: "";
+  position: absolute;
+  left: 13px;
+  bottom: -5px;
+  width: 9px;
+  height: 9px;
+  background: rgba(20, 20, 25, 0.75);
+  border-right: 1px solid rgba(255, 255, 255, 0.06);
+  border-bottom: 1px solid rgba(255, 255, 255, 0.06);
+  border-bottom-right-radius: 3px;
+  transform: rotate(45deg);
+}
+
+@keyframes msg-in {
+  from {
+    opacity: 0;
+    transform: translateY(4px);
+  }
+  to {
+    opacity: 1;
+    transform: translateY(0);
+  }
+}
+
+/* System lines are only a hint, they stay small and unboxed. */
 .chat-log .msg.system {
+  max-width: 100%;
+  margin: 1px auto 6px;
+  padding: 1px 0;
+  background: none;
+  border: none;
+  backdrop-filter: none;
+  -webkit-backdrop-filter: none;
+  font-size: 10.5px;
+  line-height: 1.3;
   color: var(--muted);
-  font-style: italic;
+  opacity: 0.7;
+  text-align: center;
 }
 
 .chat-form {
   display: flex;
-  gap: 6px;
-  padding: 8px;
+  gap: 5px;
+  padding: 5px 7px 7px;
+  flex: 0 0 auto;
 }
 
 .chat-form input {
   flex: 1 1 auto;
   min-width: 0;
-  padding: 7px 9px;
-  border-radius: 9px;
+  padding: 6px 9px;
+  border-radius: 10px;
   border: 1px solid rgba(255, 255, 255, 0.12);
   background: rgba(255, 255, 255, 0.06);
   color: var(--text);
-  font-size: 12.5px;
+  font-size: 12px;
+  line-height: 1.3;
   outline: none;
   -webkit-user-select: text;
   user-select: text;
@@ -211,13 +345,14 @@ body {
 }
 
 .chat-form button {
-  padding: 7px 12px;
-  border-radius: 9px;
+  padding: 6px 11px;
+  border-radius: 10px;
   border: none;
   background: var(--accent-strong);
   color: #2a1020;
-  font-size: 12px;
+  font-size: 11.5px;
   font-weight: 600;
+  line-height: 1.3;
   cursor: pointer;
 }
 
@@ -246,6 +381,7 @@ body {
   font-size: 11.5px;
   color: var(--muted);
   z-index: 30;
+  pointer-events: none;
 }
 
 .toast[hidden] {
@@ -264,6 +400,7 @@ body {
   box-shadow: 0 10px 30px rgba(0, 0, 0, 0.5);
   backdrop-filter: blur(8px);
   z-index: 40;
+  pointer-events: auto;
 }
 
 .menu[hidden] {
@@ -293,8 +430,138 @@ body {
   color: #ffb3c1;
 }
 
+/* An item that opens a panel of its own. */
+.menu-item-sub {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+}
+
+.menu-chevron {
+  font-size: 14px;
+  line-height: 1;
+  color: var(--muted);
+}
+
 .menu-sep {
   height: 1px;
   margin: 4px 6px;
   background: rgba(255, 255, 255, 0.09);
+}
+
+/* ---------------- outfit panel ---------------- */
+
+/* The outfit list is a panel of its own that opens next to the context menu.
+   It is a separate element because the list is longer than the menu and it
+   has to scroll. */
+.outfit-panel {
+  position: absolute;
+  min-width: 190px;
+  max-height: 340px;
+  overflow-y: auto;
+  padding: 6px;
+  border-radius: 11px;
+  background: var(--panel);
+  border: 1px solid var(--panel-border);
+  box-shadow: 0 10px 30px rgba(0, 0, 0, 0.5);
+  backdrop-filter: blur(8px);
+  z-index: 41;
+  pointer-events: auto;
+}
+
+.outfit-panel[hidden] {
+  display: none;
+}
+
+.outfit-header {
+  padding: 4px 10px 7px;
+  font-size: 10.5px;
+  letter-spacing: 0.09em;
+  text-transform: uppercase;
+  color: var(--muted);
+}
+
+.outfit-group {
+  padding: 7px 10px 3px;
+  font-size: 9.5px;
+  letter-spacing: 0.09em;
+  text-transform: uppercase;
+  color: rgba(183, 169, 198, 0.7);
+}
+
+.outfit-item {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  width: 100%;
+  padding: 6px 10px;
+  border: none;
+  border-radius: 8px;
+  background: none;
+  color: var(--text);
+  font: inherit;
+  font-size: 12.5px;
+  text-align: left;
+  cursor: pointer;
+}
+
+.outfit-item:hover {
+  background: rgba(255, 158, 199, 0.18);
+}
+
+.outfit-item.selected {
+  background: rgba(255, 158, 199, 0.22);
+}
+
+/* An outfit without artwork. It can still be picked, then the app says why
+   it cannot be worn. */
+.outfit-item.missing {
+  color: rgba(183, 169, 198, 0.6);
+}
+
+.outfit-check {
+  font-size: 12px;
+  color: var(--accent);
+}
+
+/* ---------------- resize grip ---------------- */
+
+/* The grip in the lower right corner resizes the whole overlay. It is the
+   only part of the window that is always clickable, the rest of the frame is
+   transparent and belongs to the desktop underneath. */
+.resize-grip {
+  position: absolute;
+  right: 0;
+  bottom: 0;
+  width: 22px;
+  height: 22px;
+  z-index: 50;
+  cursor: nwse-resize;
+  pointer-events: auto;
+  background:
+    linear-gradient(
+      135deg,
+      transparent 0 48%,
+      rgba(255, 255, 255, 0.16) 48% 54%,
+      transparent 54% 68%,
+      rgba(255, 255, 255, 0.16) 68% 74%,
+      transparent 74%
+    );
+  opacity: 0.55;
+  transition: opacity 0.15s ease-out;
+}
+
+.resize-grip:hover {
+  opacity: 1;
+  background:
+    linear-gradient(
+      135deg,
+      transparent 0 48%,
+      var(--accent) 48% 54%,
+      transparent 54% 68%,
+      var(--accent) 68% 74%,
+      transparent 74%
+    );
 }

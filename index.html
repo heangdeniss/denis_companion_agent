@@ -18,6 +18,7 @@
         <span id="chat-name">Aria</span>
         <button id="chat-close" class="chat-close" title="Hide chat">&times;</button>
       </header>
+      <div id="chat-status" class="chat-status"></div>
       <div id="chat-log" class="chat-log"></div>
       <form id="chat-form" class="chat-form" autocomplete="off">
         <input id="chat-input" type="text" placeholder="Say something to her..." autocomplete="off" />
@@ -30,11 +31,25 @@
     <div id="menu" class="menu" hidden>
       <button id="menu-hide" class="menu-item" type="button">Hide character</button>
       <button id="menu-chat" class="menu-item" type="button">Open chat</button>
+      <button id="menu-outfit" class="menu-item menu-item-sub" type="button">
+        <span>Change Outfit</span>
+        <span class="menu-chevron">&rsaquo;</span>
+      </button>
+      <button id="menu-size" class="menu-item" type="button">Reset size</button>
       <div class="menu-sep"></div>
       <button id="menu-quit" class="menu-item menu-item-danger" type="button">
         Quit Ei Waifu
       </button>
     </div>
+
+    <!-- The outfits of the character. It opens next to the context menu. -->
+    <section id="outfit-panel" class="outfit-panel" hidden>
+      <header class="outfit-header">Outfit</header>
+      <div id="outfit-list" class="outfit-list"></div>
+    </section>
+
+    <!-- Drag this corner to make the overlay bigger or smaller. -->
+    <div id="resize-grip" class="resize-grip" title="Drag to resize"></div>
 
     <script type="module" src="/src/main.ts"></script>
   </body>

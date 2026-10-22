@@ -12,14 +12,51 @@ export interface AppConfig {
   alwaysOnTop: boolean;
   clickThrough: boolean;
   selectedModel: string;
+  /** The outfit she is wearing, e.g. "default" or "bunny". */
+  selectedOutfit: string;
   bubbleSeconds: number;
   greetOnStart: boolean;
+  /** Width of the overlay in css pixels. */
+  windowWidth: number;
+  /** Height of the overlay in css pixels, 0 = as tall as needed. */
+  windowHeight: number;
 }
 
 export interface ModelEntry {
   name: string;
   file: string;
   kind: string;
+}
+
+/**
+ * One texture of an outfit.
+ *
+ * An outfit replaces the texture atlases of the model, the index is the
+ * atlas it belongs to.
+ */
+export interface OutfitTexture {
+  /** The index of the atlas in the model. */
+  index: number;
+  /** The path of the file inside the outfit folder. */
+  file: string;
+}
+
+/** One outfit of a character. */
+export interface OutfitEntry {
+  /** The id of the folder, e.g. "bunny". */
+  id: string;
+  /** The name that is shown in the menu. */
+  label: string;
+  /** The group the outfit is sorted into. */
+  category: string;
+  /** The folder of the outfit, relative to the server root. */
+  path: string;
+  /** The atlases this outfit replaces. */
+  textures: OutfitTexture[];
+  /** False when the assets are missing or do not fit the model. */
+  available: boolean;
+  /** Why the outfit cannot be used. */
+  problem: string;
 }
 
 export interface CursorPos {
@@ -54,4 +91,24 @@ export interface Rect {
   y: number;
   w: number;
   h: number;
+}
+
+/** Counters of the native hit test, used while debugging. */
+export interface HitStats {
+  calls: number;
+  client: number;
+  transparent: number;
+  lastX: number;
+  lastY: number;
+  lastResult: number;
+  mapUpdates: number;
+  mapBits: number;
+  cols: number;
+  rows: number;
+  cell: number;
+  scale: number;
+  rects: number;
+  enabled: boolean;
+  force: boolean;
+  fresh: boolean;
 }
