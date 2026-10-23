@@ -1,4 +1,11 @@
-import { Application, MIPMAP_MODES, RenderTexture, SCALE_MODES, Texture } from "pixi.js";
+import {
+  Application,
+  MIPMAP_MODES,
+  Point,
+  RenderTexture,
+  SCALE_MODES,
+  Texture,
+} from "pixi.js";
 import { Live2DModel, MotionPreloadStrategy } from "pixi-live2d-display/cubism4";
 import { log } from "./logger";
 import { DEFAULT_OUTFIT } from "./outfits";
@@ -43,6 +50,12 @@ const MAX_SPRITE_HEIGHT = 480;
 /** Room that is kept free above the character for the speech bubble. */
 const HEAD_ROOM = 8;
 
+/** The part of the model canvas that body space is based on. */
+interface CanvasInfo {
+  CanvasOriginY?: number;
+  PixelsPerUnit?: number;
+}
+
 /**
  * Owns the Live2D model, the pixi application and everything that makes the
  * character feel alive: eye tracking, blinking, mouth movement and the
@@ -69,6 +82,8 @@ export class Character {
 
   /** True while she is talking. The mouth moves on its own clock then. */
   private talking = false;
+  /** True while a recorded line is playing. The mouth moves with it too. */
+  private voiceTalking = false;
   /** The clock of the mouth animation, in milliseconds. */
   private talkClock = 0;
   /** The moment the last reaction was played. */
@@ -82,6 +97,18 @@ export class Character {
 
   /** Number of pixels covered by the character, refreshed with the mask. */
   opaquePixels = 0;
+
+  /**
+   * The canvas geometry of the artwork. One model unit (the unit the outfit
+   * painter uses) is `ppu` canvas pixels and the middle of body space sits at
+   * `originY`. It is read from the loaded model, so the mapping keeps working
+   * when the model is not exactly Aria's.
+   */
+  private canvas = { originY: 2250, ppu: 2400 };
+  private canvasRead = false;
+  /** Scratch points for the stage-to-canvas conversion of a tap. */
+  private readonly tapPoint = new Point();
+  private readonly tapCanvas = new Point();
 
   /** Total number of pixels in the mask. */
   maskPixels = 0;
@@ -114,12 +141,14 @@ export class Character {
       motionPreload: MotionPreloadStrategy.ALL,
     });
     this.model = model;
+    this.canvasRead = false;
     this.app.stage.addChild(model);
     // The atlases of the base model are the fallback for every outfit.
     this.baseTextures = model.textures.slice();
     this.naturalWidth = model.width || 1;
     this.naturalHeight = model.height || 1;
     this.applyScale();
+    this.readCanvasInfo();
 
     // The mouth is written right after the motions have been applied, so it
     // is not overwritten by the curves of the motion that is playing.
@@ -139,7 +168,7 @@ export class Character {
     this.optimizeTextures(model);
 
     log(
-      `model ready: ${this.naturalWidth}x${this.naturalHeight} scale=${model.scale.x.toFixed(3)} pos=${model.position.x.toFixed(1)},${model.position.y.toFixed(1)} textures=${model.textures.length} renderer=${this.app.renderer.type} viewport=${this.viewport().width}x${this.viewport().height}`,
+      `model ready: ${this.naturalWidth}x${this.naturalHeight} scale=${model.scale.x.toFixed(3)} pos=${model.position.x.toFixed(1)},${model.position.y.toFixed(1)} canvas=${this.canvas.originY}/${this.canvas.ppu} textures=${model.textures.length} renderer=${this.app.renderer.type} viewport=${this.viewport().width}x${this.viewport().height}`,
     );
 
     await this.preload();
@@ -422,6 +451,62 @@ export class Character {
     }
   }
 
+  /**
+   * Reads the canvas geometry that body space is based on.
+   *
+   * `CanvasOriginY` and `PixelsPerUnit` live in the moc3 and are exposed by
+   * the runtime on the drawable table. The fallback values are Aria's, so a
+   * failed lookup can never leave the tap mapping without a coordinate
+   * system.
+   */
+  private readCanvasInfo(): void {
+    if (this.canvasRead) return;
+    this.canvasRead = true;
+    const core = this.model?.internalModel.coreModel as unknown as {
+      _model?: {
+        canvasinfo?: CanvasInfo;
+        drawables?: { canvasinfo?: CanvasInfo };
+      };
+    };
+    const info =
+      core?._model?.drawables?.canvasinfo ?? core?._model?.canvasinfo;
+    if (
+      info &&
+      typeof info.CanvasOriginY === "number" &&
+      typeof info.PixelsPerUnit === "number" &&
+      info.PixelsPerUnit > 0
+    ) {
+      this.canvas = {
+        originY: info.CanvasOriginY,
+        ppu: info.PixelsPerUnit,
+      };
+    }
+  }
+
+  /**
+   * The height of a stage point in body space, or null when the model is not
+   * ready.
+   *
+   * Body space is the coordinate system of the outfit painter: `y = 0` is the
+   * middle of the canvas and `+1` is one PixelsPerUnit above it. Her shoes
+   * are at about -0.825 and the top of her hair at 0.849. The point is
+   * converted with the model's own transform, so the window size and the zoom
+   * are already accounted for.
+   */
+  bodyYAt(x: number, y: number): number | null {
+    const model = this.model;
+    if (!model || !Number.isFinite(x) || !Number.isFinite(y)) return null;
+    this.tapPoint.set(x, y);
+    try {
+      model.toModelPosition(this.tapPoint, this.tapCanvas);
+    } catch {
+      return null;
+    }
+    this.readCanvasInfo();
+    const bodyY = (this.canvas.originY - this.tapCanvas.y) / this.canvas.ppu;
+    return Number.isFinite(bodyY) ? bodyY : null;
+  }
+
   /** Plays a motion group, e.g. `TapBody`. */
   motion(group: string, index = 0, priority = 3): void {
     if (!this.model) return;
@@ -448,6 +533,31 @@ export class Character {
   }
 
   /**
+   * Goes back to the default expression.
+   *
+   * The expression manager blends the empty default expression in, so the
+   * face relaxes over a moment instead of snapping back. The tap reactions
+   * call this after a few seconds; a reaction face is not a new resting face.
+   */
+  clearExpression(): void {
+    const manager = (
+      this.model?.internalModel as unknown as {
+        motionManager?: {
+          expressionManager?: { resetExpression?: () => void };
+        };
+      }
+    )?.motionManager?.expressionManager;
+    if (!manager?.resetExpression) return;
+    try {
+      manager.resetExpression();
+      this.expressionChanges++;
+      this.lastMaskAt = 0;
+    } catch {
+      /* the model has no expression manager */
+    }
+  }
+
+  /**
    * She starts talking.
    *
    * From now on the mouth moves on its own rhythm. The text stream has no
@@ -465,6 +575,22 @@ export class Character {
     if (!this.talking) return;
     this.talking = false;
     log("animation: idle");
+  }
+
+  /**
+   * Starts the mouth for a recorded line.
+   *
+   * This is separate from `startTalking` because a chat stream and a tap line
+   * can overlap: the mouth keeps moving until both are done, and stopping one
+   * of them never closes the mouth of the other.
+   */
+  startVoiceTalking(): void {
+    this.voiceTalking = true;
+  }
+
+  /** The recorded line ended, the mouth may close now. */
+  stopVoiceTalking(): void {
+    this.voiceTalking = false;
   }
 
   /**
@@ -504,7 +630,8 @@ export class Character {
     const state = manager?.state;
     const expression = manager?.expressionManager?.currentExpressionIndex;
     return [
-      `talk=${this.talking ? 1 : 0}`,
+      `talk=${this.talking || this.voiceTalking ? 1 : 0}`,
+      `voice=${this.voiceTalking ? 1 : 0}`,
       `mouth=${this.mouth.toFixed(2)}`,
       `motion=${state?.currentGroup ?? "-"}:${state?.currentIndex ?? "-"}`,
       `prio=${state?.currentPriority ?? 0}`,
@@ -610,7 +737,7 @@ export class Character {
    * over a moment instead of snapping shut.
    */
   private updateMouth(dt: number): void {
-    if (this.talking) {
+    if (this.talking || this.voiceTalking) {
       this.talkClock += dt;
       const t = this.talkClock / 1000;
       const wave =

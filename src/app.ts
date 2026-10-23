@@ -2,10 +2,12 @@ import { listen } from "@tauri-apps/api/event";
 import { Application, UPDATE_PRIORITY } from "pixi.js";
 import { Character } from "./character";
 import { Chat } from "./chat";
+import { Interaction } from "./interaction";
 import { api } from "./ipc";
 import { log } from "./logger";
 import { groupOutfits, mergeOutfits, DEFAULT_OUTFIT } from "./outfits";
 import type { AppConfig, Rect } from "./types";
+import { Voice } from "./voice";
 
 const POLL_INTERVAL = 40;
 /** How often the silhouette is handed over to the native hit test (ms). */
@@ -23,22 +25,6 @@ const GREETINGS = [
   "You look busy... want a small break?",
   "Good to see you again!",
 ];
-
-const HEAD_REACTIONS = [
-  "H-hey! That tickles~",
-  "Ehehe, careful~",
-  "Aaaa, that's ticklish!",
-  "You always make me blush...",
-];
-
-const BODY_REACTIONS = [
-  "W-wha?!",
-  "Hey, not so sudden!",
-  "H-hey! I'm right here, you know.",
-  "S-stop that (^-^)",
-];
-
-const IDLE_REACTIONS = ["Hm?", "What is it?", "I'm listening~"];
 
 function clamp(value: number, min: number, max: number): number {
   return Math.min(max, Math.max(min, value));
@@ -620,30 +606,47 @@ export async function bootstrap(): Promise<void> {
 
   // ---------------------------------------------------------------- tapping
   /**
-   * A tap is answered with a reaction: a motion, an expression and a line.
-   *
-   * The motion and the expression are rate limited inside the character, so
-   * a single click can never restart a motion that is still playing. That
-   * restart was the reason she was jumping between the poses.
+   * The recordings live next to the model folder, in
+   * `assets/characters/<name>/sounds/`. The path is derived from the model
+   * file (`<character>/<variant>/<model>.json`), so another character keeps
+   * its own lines.
    */
-  function handleTap(areas: string[]): void {
-    const lower = areas.map((a) => a.toLowerCase());
+  const characterFolder = entry.file.split("/").slice(0, -2).join("/");
+  const soundsRoot = `${base}${characterFolder
+    .split("/")
+    .map(encodeURIComponent)
+    .join("/")}/sounds/`;
 
-    if (lower.some((a) => a.includes("head"))) {
-      character.react("TapBody", "F05", 0);
-      const line = pick(HEAD_REACTIONS);
+  const voice = new Voice();
+  const interaction = new Interaction({
+    character,
+    voice,
+    say: (line) => {
       chat.say(line);
       showBubble(line);
-    } else if (lower.some((a) => a.includes("body"))) {
-      character.react("TapBody", "F03", 1);
-      const line = pick(BODY_REACTIONS);
-      chat.say(line);
-      showBubble(line);
-    } else {
-      const line = pick(IDLE_REACTIONS);
-      chat.say(line);
-      showBubble(line);
-    }
+    },
+  });
+  void voice
+    .attach(soundsRoot)
+    .catch((error) => log(`voice: the sounds could not be loaded (${error})`));
+
+  // The controller is reachable from the dev tools like the model itself, so
+  // the body regions can be checked against a known point of the canvas.
+  (window as unknown as { ei: unknown }).ei = {
+    app,
+    character,
+    interaction,
+    voice,
+  };
+
+  /**
+   * A tap is answered by the body region under the cursor: head/hair,
+   * face/cheeks, chest/ribbon, torso/waist or skirt/legs. Every region has
+   * its own expression, motion, line and recording (see `interaction.ts`).
+   */
+  function handleTap(x: number, y: number): void {
+    const areas = character.hitTest(x, y);
+    interaction.tap(x, y, areas);
   }
 
   // ---------------------------------------------------------------- pointer
@@ -712,8 +715,7 @@ export async function bootstrap(): Promise<void> {
     await setHitForce(false);
 
     if (!pointerMoved) {
-      const areas = character.hitTest(event.clientX, event.clientY);
-      handleTap(areas);
+      handleTap(event.clientX, event.clientY);
     }
   });
 

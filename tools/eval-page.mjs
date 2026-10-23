@@ -6,7 +6,11 @@ const PORT = 9222;
 const expression = process.argv[2];
 
 const list = await (await fetch(`http://127.0.0.1:${PORT}/json/list`)).json();
-const page = list.find((t) => t.type === "page" && t.url.startsWith("http://tauri.localhost"));
+// Release builds serve the page from http://tauri.localhost, `tauri dev` from
+// http://localhost:1420. Both are the app, and both expose `window.ei`.
+const page = list.find(
+  (t) => t.type === "page" && /^http:\/\/(tauri\.)?localhost/.test(t.url),
+);
 if (!page) throw new Error("page not found");
 const ws = new WebSocket(page.webSocketDebuggerUrl);
 let id = 0;

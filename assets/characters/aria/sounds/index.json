@@ -1,0 +1,10 @@
+{
+  "version": 1,
+  "note": "One folder per touch region. Every file listed here is preloaded and played when that part of her body is clicked. Add a recording to the folder and list it here, the next start uses it.",
+  "lines": {
+    "headpat": ["headpat/line1.wav"],
+    "poke": ["poke/line1.wav"],
+    "flustered": ["flustered/line1.wav"],
+    "surprise": ["surprise/line1.wav"]
+  }
+}
