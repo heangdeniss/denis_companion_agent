@@ -61,8 +61,8 @@ impl Default for AppConfig {
             personality: "warm, playful and a little teasing. genuinely curious about the user's day".into(),
             llm_provider: "ollama".into(),
             llm_model: "qwen2.5:1.5b".into(),
-            ollama_base_url: "http://localhost:11434".into(),
-            lmstudio_base_url: "http://localhost:1234".into(),
+            ollama_base_url: "http://127.0.0.1:11434".into(),
+            lmstudio_base_url: "http://127.0.0.1:1234".into(),
             temperature: 0.9,
             affinity: 0.25,
             scale: 1.0,
@@ -126,6 +126,19 @@ fn load_config(app: &AppHandle) -> AppConfig {
             }
         }
     }
+
+    // Configs written before the loopback address was pinned still say
+    // `localhost`, which on Windows can resolve to `::1` while the server only
+    // listens on `127.0.0.1`. The migration is written back so the file and
+    // the running app agree.
+    let ollama = llm::loopback(&cfg.ollama_base_url);
+    let lmstudio = llm::loopback(&cfg.lmstudio_base_url);
+    if ollama != cfg.ollama_base_url || lmstudio != cfg.lmstudio_base_url {
+        cfg.ollama_base_url = ollama;
+        cfg.lmstudio_base_url = lmstudio;
+        let _ = save_config(app, &cfg);
+    }
+
     cfg
 }
 
@@ -474,6 +487,12 @@ fn relative_to(root: &Path, path: &Path) -> String {
 /// The model file is given relative to the server root. A character folder
 /// may hold a "base" folder with the model and an "outfits" folder next to
 /// it, a plain model folder holds its outfits inside itself.
+///
+/// An outfit replaces the texture page with the clothes, e.g.
+/// `outfits/bunny/texture_01.png` for the page `texture_01.png` of the model.
+/// The page with the body, the head and the face is never part of an outfit,
+/// so the face stays the same in every outfit. An outfit without that file
+/// is not an error, it simply wears the base clothes.
 #[tauri::command]
 fn list_outfits(app: AppHandle, model: String) -> Vec<OutfitEntry> {
     let mut out: Vec<(i32, OutfitEntry)> = Vec::new();
@@ -545,9 +564,9 @@ fn list_outfits(app: AppHandle, model: String) -> Vec<OutfitEntry> {
             }
         }
 
-        if textures.is_empty() && problem.is_empty() {
-            problem = "the texture atlases are missing".to_string();
-        }
+        // An outfit without artwork is not an error: the base clothes stay on
+        // and the menu marks the outfit as "no artwork yet". Only a file that
+        // does not fit the model is a problem.
 
         out.push((
             manifest.order.unwrap_or(99),
@@ -877,8 +896,14 @@ async fn chat(
 ) -> Result<(), String> {
     let cfg = state.config.lock().unwrap().clone();
     let backend = llm::detect_backends(&cfg).await;
-    if backend.provider.is_empty() {
-        let msg = backend.error.clone();
+    // A reachable server is not enough: a missing model is reported as an
+    // error too, so the chat never silently runs on a different model.
+    if backend.provider.is_empty() || !backend.error.is_empty() {
+        let msg = if backend.error.is_empty() {
+            "No local inference server found. Start Ollama or LM Studio.".to_string()
+        } else {
+            backend.error.clone()
+        };
         let _ = app.emit("chat:error", msg);
         return Ok(());
     }

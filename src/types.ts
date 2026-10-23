@@ -31,8 +31,8 @@ export interface ModelEntry {
 /**
  * One texture of an outfit.
  *
- * An outfit replaces the texture atlases of the model, the index is the
- * atlas it belongs to.
+ * An outfit replaces the texture page of the model that holds the clothes,
+ * the index is the position of that page in the texture list of the model.
  */
 export interface OutfitTexture {
   /** The index of the atlas in the model. */
@@ -53,7 +53,7 @@ export interface OutfitEntry {
   path: string;
   /** The atlases this outfit replaces. */
   textures: OutfitTexture[];
-  /** False when the assets are missing or do not fit the model. */
+  /** False when the artwork is broken, e.g. the wrong size. */
   available: boolean;
   /** Why the outfit cannot be used. */
   problem: string;

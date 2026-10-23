@@ -1,7 +1,22 @@
 import { Application, MIPMAP_MODES, RenderTexture, SCALE_MODES, Texture } from "pixi.js";
 import { Live2DModel, MotionPreloadStrategy } from "pixi-live2d-display/cubism4";
 import { log } from "./logger";
-import type { OutfitEntry } from "./types";
+import { DEFAULT_OUTFIT } from "./outfits";
+import type { OutfitEntry, OutfitTexture } from "./types";
+
+/**
+ * The texture page of the model that holds the clothes.
+ *
+ * Aria's model has two texture pages: `texture_00` holds the body, the head,
+ * the hair and the face, `texture_01` holds the clothes (skirt, vest,
+ * sleeves, scarf). The index is the position of the page in the texture list
+ * of `Haru.model3.json`.
+ *
+ * Only this page is ever replaced when an outfit is picked. The first page
+ * stays the base artwork, so her face, her hair and every expression are the
+ * same in every outfit.
+ */
+const CLOTHING_TEXTURE_INDEX = 1;
 
 /** How often the alpha mask is refreshed (ms). */
 const MASK_INTERVAL = 95;
@@ -206,20 +221,24 @@ export class Character {
   /**
    * Puts another outfit on her.
    *
-   * An outfit is a second set of texture atlases that uses the same UV layout
-   * as the base model. The mesh, the physics, the expressions and the motions
-   * are not touched at all - only the pixels of the atlases are replaced.
-   * That is why switching an outfit can never move her head or break the
-   * alignment of the overlay, and why the model does not have to be reloaded
-   * (a reload would show a blank frame).
+   * An outfit is the texture page with the clothes: the file
+   * `<outfit folder>/texture_01.png` is loaded and bound to the texture
+   * index of the clothes. The page with the body, the head and the face is
+   * never touched, so her face and her hair stay the same in every outfit.
    *
-   * The swap happens between two frames, so the change is clean: there is no
-   * flicker and no stale silhouette, the mask is refreshed right after it.
+   * The mesh, the physics and the motions are not touched either, so
+   * switching an outfit can never move her head or break the alignment of
+   * the overlay, and the model does not have to be reloaded (a reload would
+   * show a blank frame).
+   *
+   * When the outfit folder has no clothing page, the base clothes stay on.
+   * That is a safe fallback, not an error: she is never left with a broken
+   * texture.
    *
    * @param outfit the outfit to wear, `null` puts the default outfit back.
    * @param baseUrl the url of the server that serves the assets.
-   * @returns false when the artwork could not be loaded, the default outfit
-   *          is worn in that case.
+   * @returns false when the artwork is broken, the default outfit is worn
+   *          in that case.
    */
   async setOutfit(
     outfit: OutfitEntry | null,
@@ -228,76 +247,89 @@ export class Character {
     const model = this.model;
     if (!model) return false;
 
-    if (!outfit || outfit.id === "default" || !outfit.textures.length) {
+    if (!outfit || outfit.id === DEFAULT_OUTFIT) {
       this.applyTextures(this.baseTextures);
-      this.outfitId = "default";
-      log(`outfit: default (${model.textures.length} atlases)`);
+      this.outfitId = DEFAULT_OUTFIT;
+      log("outfit: default");
       return true;
     }
 
-    const textures = await this.loadOutfitTextures(outfit, baseUrl);
-    if (!textures) {
-      // The artwork is broken or does not fit: the default outfit stays on.
+    // Only the clothing page may be replaced. Everything else stays the base
+    // artwork, that is what keeps the face and the hair intact.
+    const clothing = outfit.textures.find(
+      (texture) => texture.index === CLOTHING_TEXTURE_INDEX,
+    );
+    const ignored = outfit.textures.filter(
+      (texture) => texture.index !== CLOTHING_TEXTURE_INDEX,
+    );
+    if (ignored.length) {
+      log(
+        `outfit ${outfit.id}: only the clothing page can be swapped, ${ignored.length} other page(s) are ignored`,
+      );
+    }
+
+    if (!clothing) {
+      // No clothing artwork in the outfit folder: the base clothes stay on.
       this.applyTextures(this.baseTextures);
-      this.outfitId = "default";
+      this.outfitId = outfit.id;
+      log(
+        `outfit: ${outfit.id} (no clothing artwork, the base clothes are used)`,
+      );
+      return true;
+    }
+
+    const textures = await this.loadOutfitTextures(outfit, clothing, baseUrl);
+    if (!textures) {
+      // The artwork is broken or does not fit: the outfit stays as it was.
       return false;
     }
 
     this.applyTextures(textures);
     this.outfitId = outfit.id;
-    log(`outfit: ${outfit.id} (${textures.length} atlases)`);
+    log(
+      `outfit: ${outfit.id} (clothing page ${CLOTHING_TEXTURE_INDEX} = ${clothing.file})`,
+    );
     return true;
   }
 
   /**
-   * Loads the atlases of an outfit.
+   * Loads the clothing page of an outfit.
    *
-   * They are only fetched once, afterwards they are reused. The result is
-   * `null` when a file is missing or when an atlas is not exactly as big as
-   * the one it replaces - the mesh addresses the pixels by UV coordinates, so
-   * a different size would stretch the drawing.
+   * The file is only fetched once, afterwards it is reused. The result is
+   * `null` when the file is missing or when it is not exactly as big as the
+   * page it replaces - the mesh addresses the pixels by UV coordinates, so a
+   * different size would stretch the drawing.
    */
   private async loadOutfitTextures(
     outfit: OutfitEntry,
+    clothing: OutfitTexture,
     baseUrl: string,
   ): Promise<Texture[] | null> {
     const cached = this.outfitTextures.get(outfit.id);
     if (cached) return cached;
 
     try {
-      const loaded = await Promise.all(
-        outfit.textures.map(async (texture) => {
-          const path = texture.file
-            .split("/")
-            .map(encodeURIComponent)
-            .join("/");
-          const url = `${baseUrl}${outfit.path}/${path}`;
-          const atlas = await Texture.fromURL(url, {
-            scaleMode: SCALE_MODES.LINEAR,
-            mipmap: MIPMAP_MODES.ON,
-            anisotropicLevel: this.anisotropy,
-          });
-          return { index: texture.index, atlas };
-        }),
-      );
+      const path = clothing.file.split("/").map(encodeURIComponent).join("/");
+      const url = `${baseUrl}${outfit.path}/${path}`;
+      const atlas = await Texture.fromURL(url, {
+        scaleMode: SCALE_MODES.LINEAR,
+        mipmap: MIPMAP_MODES.ON,
+        anisotropicLevel: this.anisotropy,
+      });
 
-      for (const { index, atlas } of loaded) {
-        const base = this.baseTextures[index];
-        if (!base) {
-          throw new Error(`the model has no atlas ${index}`);
-        }
-        if (atlas.width !== base.width || atlas.height !== base.height) {
-          throw new Error(
-            `atlas ${index} is ${atlas.width}x${atlas.height}, the model needs ${base.width}x${base.height}`,
-          );
-        }
+      const base = this.baseTextures[CLOTHING_TEXTURE_INDEX];
+      if (!base) {
+        throw new Error(`the model has no texture page ${CLOTHING_TEXTURE_INDEX}`);
+      }
+      if (atlas.width !== base.width || atlas.height !== base.height) {
+        throw new Error(
+          `${clothing.file} is ${atlas.width}x${atlas.height}, the model needs ${base.width}x${base.height}`,
+        );
       }
 
-      // The atlases that the outfit does not replace stay the base ones.
+      // The clothing page is replaced, every other page stays the base one.
       const textures = this.baseTextures.slice();
-      for (const { index, atlas } of loaded) {
-        textures[index] = atlas;
-      }
+      textures[CLOTHING_TEXTURE_INDEX] = atlas;
       this.outfitTextures.set(outfit.id, textures);
       return textures;
     } catch (error) {

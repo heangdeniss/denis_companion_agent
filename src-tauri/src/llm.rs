@@ -31,6 +31,20 @@ fn client() -> Result<reqwest::Client, String> {
         .map_err(|e| e.to_string())
 }
 
+/// Ollama only listens on `127.0.0.1`, but on Windows `localhost` resolves to
+/// `::1` first. The literal address removes that ambiguity, so a probe can not
+/// fail while the server is actually up.
+pub fn loopback(url: &str) -> String {
+    url.trim().trim_end_matches('/').replace("://localhost", "://127.0.0.1")
+}
+
+/// `qwen2.5` and `qwen2.5:latest` are the same model to Ollama.
+fn same_model(installed: &str, configured: &str) -> bool {
+    installed == configured
+        || installed == format!("{configured}:latest")
+        || format!("{installed}:latest") == configured
+}
+
 /// Probes the known local inference servers. Ollama is preferred, LM Studio is
 /// the fallback. Both speak OpenAI-ish protocols so the frontend can treat
 /// them uniformly.
@@ -45,9 +59,12 @@ pub async fn detect_backends(cfg: &AppConfig) -> BackendInfo {
         }
     };
 
+    let ollama_url = loopback(&cfg.ollama_base_url);
+    let lmstudio_url = loopback(&cfg.lmstudio_base_url);
+
     let mut ollama_models: Vec<String> = Vec::new();
     if let Ok(resp) = http
-        .get(format!("{}/api/tags", cfg.ollama_base_url))
+        .get(format!("{ollama_url}/api/tags"))
         .send()
         .await
     {
@@ -66,7 +83,7 @@ pub async fn detect_backends(cfg: &AppConfig) -> BackendInfo {
 
     let mut lmstudio_models: Vec<String> = Vec::new();
     if let Ok(resp) = http
-        .get(format!("{}/v1/models", cfg.lmstudio_base_url))
+        .get(format!("{lmstudio_url}/v1/models"))
         .send()
         .await
     {
@@ -88,15 +105,15 @@ pub async fn detect_backends(cfg: &AppConfig) -> BackendInfo {
 
     if prefer_ollama && !ollama_models.is_empty() {
         info.provider = "ollama".into();
-        info.base_url = cfg.ollama_base_url.clone();
+        info.base_url = ollama_url.clone();
         info.models = ollama_models;
     } else if !lmstudio_models.is_empty() {
         info.provider = "lmstudio".into();
-        info.base_url = cfg.lmstudio_base_url.clone();
+        info.base_url = lmstudio_url.clone();
         info.models = lmstudio_models;
     } else if !ollama_models.is_empty() {
         info.provider = "ollama".into();
-        info.base_url = cfg.ollama_base_url.clone();
+        info.base_url = ollama_url;
         info.models = ollama_models;
     }
 
@@ -105,8 +122,23 @@ pub async fn detect_backends(cfg: &AppConfig) -> BackendInfo {
         return info;
     }
 
-    info.active_model = if !cfg.llm_model.is_empty() && info.models.iter().any(|m| m == &cfg.llm_model) {
-        cfg.llm_model.clone()
+    // The list is sorted, so "the first model" is the same model on every
+    // start instead of whatever the server happens to return first.
+    info.models.sort();
+
+    // The configured model is the one she always talks to. If it is not
+    // installed the reason is reported instead of silently switching to a
+    // different model - that would change her voice from one run to the next.
+    let configured = cfg.llm_model.trim().to_string();
+    info.active_model = if !configured.is_empty() {
+        if info.models.iter().any(|m| same_model(m, &configured)) {
+            configured
+        } else {
+            info.error = format!(
+                "Model '{configured}' is not installed. Run: ollama pull {configured}"
+            );
+            configured
+        }
     } else {
         info.models.first().cloned().unwrap_or_default()
     };
@@ -131,6 +163,10 @@ pub async fn stream_chat(
                 "model": model,
                 "messages": messages,
                 "stream": true,
+                // The model is small but a cold load still takes a few
+                // seconds. Keeping it in memory between messages makes the
+                // first token arrive at the same speed every time.
+                "keep_alive": "30m",
                 "options": { "temperature": cfg.temperature }
             });
             let resp = http

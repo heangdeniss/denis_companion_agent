@@ -112,6 +112,10 @@ export async function bootstrap(): Promise<void> {
   stageEl.appendChild(canvas);
 
   const character = new Character(app);
+  // A small hook for the asset tooling and the dev tools of the webview: it
+  // makes the live model reachable, which is how the UV layout of the texture
+  // atlases is read while an outfit is painted.
+  (window as unknown as { ei: unknown }).ei = { app, character };
 
   // ---------------------------------------------------------------- model
   const models = await api.listModels();
@@ -154,7 +158,12 @@ export async function bootstrap(): Promise<void> {
   );
   log(
     `outfits: ${outfitOptions
-      .map((option) => `${option.id}${option.available ? "" : " (missing)"}`)
+      .map(
+        (option) =>
+          `${option.id}${option.available ? "" : " (broken)"}${
+            option.hasArtwork ? "" : " (no artwork)"
+          }`,
+      )
       .join(", ")}`,
   );
   // The mouth is animated on its own clock, the text stream never touches it.
@@ -267,6 +276,59 @@ export async function bootstrap(): Promise<void> {
     chatStatus.classList.toggle("error", isError);
   }
 
+  // ---------------------------------------------------------------- backend
+  // Ollama is often still starting when the overlay appears, and it can be
+  // restarted at any time. A single probe at boot would leave the chat on
+  // "offline" until the app itself is restarted, so the server is re-probed
+  // whenever the chat opens and then on a timer.
+  let backendOnline = false;
+  let backendProbe: Promise<boolean> | null = null;
+
+  async function refreshBackend(announce = false): Promise<boolean> {
+    if (backendProbe) return backendProbe;
+    backendProbe = (async () => {
+      try {
+        const backend = await api.detectBackend();
+        const online = !backend.error && !!backend.provider;
+        if (online !== backendOnline) {
+          log(`backend ${online ? "online" : "offline"}`, backend);
+        }
+        backendOnline = online;
+
+        if (online) {
+          setChatStatus(`connected · ${backend.provider} · ${backend.activeModel}`);
+        } else {
+          const reason = backend.error || "no local inference server";
+          setChatStatus(`offline · ${reason}`, true);
+          if (announce) showToast(reason);
+        }
+        return online;
+      } catch (error) {
+        backendOnline = false;
+        const reason = String(error);
+        log("backend probe failed", reason);
+        setChatStatus(`offline · ${reason}`, true);
+        if (announce) showToast(reason);
+        return false;
+      } finally {
+        backendProbe = null;
+      }
+    })();
+    return backendProbe;
+  }
+
+  /**
+   * While she is offline the server is probed every few seconds, while the
+   * connection is fine only twice a minute - enough to notice a restart
+   * without polling the loopback port for no reason.
+   */
+  function watchBackend(): void {
+    window.setTimeout(async () => {
+      await refreshBackend();
+      watchBackend();
+    }, backendOnline ? 30_000 : 4_000);
+  }
+
   function toggleChat(force?: boolean): void {
     const show = force ?? chatEl.hidden;
     chatEl.hidden = !show;
@@ -275,6 +337,8 @@ export async function bootstrap(): Promise<void> {
       bubbleEl.hidden = true;
       layoutChat();
       chatInput.focus();
+      // The server may have come up (or died) since the last probe.
+      void refreshBackend();
     }
     // The panel changes the height of the overlay.
     void applyAutoSize();
@@ -300,6 +364,9 @@ export async function bootstrap(): Promise<void> {
     },
     onError: (message) => {
       character.stopTalking();
+      // The retry loop goes back to the fast cadence so a restarted server is
+      // picked up on its own.
+      backendOnline = false;
       logMessage(`[error] ${message}`, "system");
       setChatStatus(`offline · ${message}`, true);
       showToast(message);
@@ -438,7 +505,8 @@ export async function bootstrap(): Promise<void> {
       options.every(
         (option, index) =>
           option.id === outfitOptions[index].id &&
-          option.available === outfitOptions[index].available,
+          option.available === outfitOptions[index].available &&
+          option.hasArtwork === outfitOptions[index].hasArtwork,
       );
     if (same) return;
 
@@ -446,7 +514,12 @@ export async function bootstrap(): Promise<void> {
     buildOutfitList();
     log(
       `outfits: ${options
-        .map((option) => `${option.id}${option.available ? "" : " (missing)"}`)
+        .map(
+          (option) =>
+            `${option.id}${option.available ? "" : " (broken)"}${
+              option.hasArtwork ? "" : " (no artwork)"
+            }`,
+        )
         .join(", ")}`,
     );
   }
@@ -468,12 +541,16 @@ export async function bootstrap(): Promise<void> {
         if (option.id === config.selectedOutfit) {
           button.classList.add("selected");
         }
-        if (!option.available) {
+        // An outfit without artwork is marked, it can still be picked: the
+        // base clothes stay on then.
+        if (!option.available || !option.hasArtwork) {
           button.classList.add("missing");
         }
-        button.title = option.available
-          ? option.label
-          : `${option.label} - ${option.problem || "no artwork yet"}`;
+        button.title = !option.available
+          ? `${option.label} - ${option.problem || "the artwork is broken"}`
+          : option.hasArtwork
+            ? option.label
+            : `${option.label} - no artwork yet, the base clothes are used`;
 
         const label = document.createElement("span");
         label.textContent = option.label;
@@ -497,9 +574,10 @@ export async function bootstrap(): Promise<void> {
   /**
    * Puts an outfit on her and remembers it.
    *
-   * An outfit whose artwork is missing - or that does not fit the model -
-   * falls back to the default outfit, so the character is never left with a
-   * broken texture.
+   * An outfit without artwork wears the base clothes: that is a safe
+   * fallback, not an error, and the choice is remembered so the outfit is
+   * there as soon as it is painted. Only broken artwork (a wrong size, an
+   * unreadable file) is reported, then the default outfit stays on.
    */
   async function applyOutfit(id: string, quiet = false): Promise<void> {
     const wanted = outfitOptions.find((option) => option.id === id);
@@ -509,9 +587,10 @@ export async function bootstrap(): Promise<void> {
 
     let target = wanted;
     if (!wanted.available) {
+      // The artwork is broken: the base clothes stay on.
       if (!quiet) {
         showToast(
-          `${wanted.label}: ${wanted.problem || "no artwork"} - keeping the default outfit.`,
+          `${wanted.label}: ${wanted.problem || "the artwork is broken"} - keeping the default outfit.`,
         );
       }
       log(`outfit ${wanted.id} is not available: ${wanted.problem}`);
@@ -525,7 +604,9 @@ export async function bootstrap(): Promise<void> {
       ok = await character.setOutfit(target, base);
     }
     if (!ok) {
-      showToast(`Could not wear the ${target.label} - keeping the default outfit.`);
+      if (!quiet) {
+        showToast(`Could not wear the ${target.label} - keeping the default outfit.`);
+      }
       target = fallback;
       await character.setOutfit(null, base);
     }
@@ -917,14 +998,10 @@ export async function bootstrap(): Promise<void> {
   }
   await applyAutoSize();
 
-  const backend = await api.detectBackend();
-  log("backend detected", backend);
-  if (backend.error) {
-    showToast(backend.error);
-    setChatStatus(`offline · ${backend.error}`, true);
-  } else {
-    setChatStatus(`connected · ${backend.provider} · ${backend.activeModel}`);
-  }
+  // The backend is probed now and then watched on a timer: Ollama is often
+  // still starting when the window appears, and it may be restarted later.
+  await refreshBackend(true);
+  watchBackend();
 
   if (config.greetOnStart) {
     const line = pick(GREETINGS);
