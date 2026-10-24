@@ -3,13 +3,36 @@ import { api } from "./ipc";
 import { log } from "./logger";
 import type { AppConfig, ChatMsg } from "./types";
 
+/** Replies that are sent back to the model as context. */
+const MAX_HISTORY = 24;
+
 export interface ChatCallbacks {
   onDelta: (text: string) => void;
   onDone: (fullText: string) => void;
   onError: (message: string) => void;
 }
 
-const MAX_HISTORY = 24;
+/**
+ * Extracts the emotion tag from the beginning of a message.
+ *
+ * Returns `{ tag, text }` where `text` has the tag removed. While the reply is
+ * still streaming the tag may be incomplete (`"[hap"`), that fragment is
+ * hidden as well so the bubble never shows brackets.
+ */
+export function extractEmotionTag(text: string): {
+  tag: string | null;
+  text: string;
+} {
+  const complete = text.match(/^\s*\[([a-zA-Z]+)\]\s*([\s\S]*)$/);
+  if (complete) {
+    return { tag: complete[1], text: complete[2] };
+  }
+  const partial = text.match(/^\s*\[[a-zA-Z]*\s*([\s\S]*)$/);
+  if (partial) {
+    return { tag: null, text: partial[1] };
+  }
+  return { tag: null, text };
+}
 
 function affinityLabel(affinity: number): string {
   if (affinity < 0.15) return "You have just met and are still a little shy.";
@@ -32,6 +55,9 @@ export class Chat {
     return this.busy;
   }
 
+  /**
+   * Update the system prompt to instruct Aria to prefix replies with emotion tags.
+   */
   systemPrompt(): string {
     const name = this.config.personaName || "your companion";
     const user = this.config.userName || "you";
@@ -49,6 +75,9 @@ export class Chat {
       "- Warm, casual and slightly playful. Use emotes like (^-^) or :) sparingly.",
       "- React to what the user actually said; pick up on earlier details when it fits.",
       "- Never repeat your last line verbatim.",
+      "- ALWAYS prefix your reply with ONE emotion tag in square brackets from this list: [happy], [blush], [pout], [surprised], [wink], [think], [neutral]. Choose the tag that best matches your emotional response.",
+      "- Place the tag at the very beginning of your response, followed by a space and then your reply.",
+      "- Example: '[happy] Glad to see you again~'",
     ].join("\n");
   }
 

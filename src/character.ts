@@ -56,6 +56,38 @@ interface CanvasInfo {
   PixelsPerUnit?: number;
 }
 
+/** How long the face of an emotion tag stays before it relaxes again (ms). */
+const EMOTION_HOLD = 4200;
+
+/**
+ * The expression that belongs to each emotion tag of a reply.
+ *
+ * The ids are the files in `assets/characters/aria/base/expressions`:
+ * `F01` is the open smile, `F02` the calm resting face, `F03` the pout,
+ * `F04` the blush, `F05` the closed-eye laugh, `F06` the wide-eyed surprise,
+ * `F07` the shy face with `ParamTere` and `F08` the thoughtful face.
+ */
+const EMOTION_EXPRESSIONS: Record<string, string> = {
+  happy: "F05",
+  laugh: "F05",
+  wink: "F05",
+  smile: "F01",
+  joy: "F01",
+  blush: "F04",
+  fluster: "F04",
+  flustered: "F04",
+  embarrassed: "F04",
+  shy: "F04",
+  pout: "F03",
+  angry: "F03",
+  annoyed: "F03",
+  surprised: "F06",
+  surprise: "F06",
+  shock: "F06",
+  think: "F08",
+  thinking: "F08",
+};
+
 /**
  * Owns the Live2D model, the pixi application and everything that makes the
  * character feel alive: eye tracking, blinking, mouth movement and the
@@ -127,8 +159,57 @@ export class Character {
   /** The anisotropic filtering that is used for the atlases. */
   private anisotropy = 1;
 
+  // ---------------------------------------------------------------- cursor tracking
+  /** Target gaze in normalized model space (-1..1). */
+  private gazeTargetX = 0;
+  private gazeTargetY = 0;
+  private gazeX = 0;
+  private gazeY = 0;
+  /** Last time the mouse moved inside the window. */
+  private lastMouseMoveAt = 0;
+  /** When true the mouse is considered idle. */
+  private mouseIdle = false;
+  /** Time in ms before returning to center. */
+  private readonly idleTimeout = 3000;
+  /** Smoothing factor for gaze interpolation. */
+  private readonly gazeLerp = 0.18;
+  /** Smoothing factor for returning to center. */
+  private readonly centerLerp = 0.08;
+
+  // ---------------------------------------------------------------- audio lip-sync
+  /** The graph that reads the volume of a recorded line. */
+  private audioContext: AudioContext | null = null;
+  private analyser: AnalyserNode | null = null;
+  private dataArray: Uint8Array<ArrayBuffer> | null = null;
+  /**
+   * The source node of every element that was ever played.
+   *
+   * A media element can be attached to one source node only, for its whole
+   * life. The nodes are kept and reused, so the same line can drive the mouth
+   * again the second time it is played instead of falling back to silence.
+   */
+  private readonly audioSources = new Map<
+    HTMLAudioElement,
+    MediaElementAudioSourceNode
+  >();
+  /** The element whose volume drives the mouth right now, if any. */
+  private currentAudioElement: HTMLAudioElement | null = null;
+  /** The smoothed opening of the mouth while a line is playing. */
+  private audioMouth = 0;
+  /** True while a recorded line is playing and the analyser has data. */
+  private useAudioMouth = false;
+  /** True while streamed text is being typed out. */
+  private textSpeaking = false;
+  /** Phase of the simulated syllable mouth. */
+  private textPhase = 0;
+  /** The expression that was set by the last emotion tag. */
+  private pendingExpression: string | null = null;
+  /** Auto-clear timer of the emotion expression. */
+  private expressionTimer: number | undefined;
+
   constructor(app: Application) {
     this.app = app;
+    this.lastMouseMoveAt = performance.now();
   }
 
   async load(url: string): Promise<Live2DModel> {
@@ -158,7 +239,13 @@ export class Character {
         on: (event: string, listener: () => void) => void;
       };
     };
-    internal.on("afterMotionUpdate", () => this.applyMouth());
+    internal.on("afterMotionUpdate", () => {
+      // Both are written after the motion curves, so a swaying idle motion can
+      // not pull the head or the mouth away from where they should be. The
+      // physics step runs after this, so the hair and the body still follow.
+      this.applyGaze();
+      this.applyMouth();
+    });
     // Every motion that is really started is counted. A fast growing number
     // in the heartbeat means she is changing her pose over and over again.
     internal.motionManager.on("motionStart", () => {
@@ -166,6 +253,8 @@ export class Character {
     });
 
     this.optimizeTextures(model);
+    this.initGaze();
+    this.initAudioLipSync();
 
     log(
       `model ready: ${this.naturalWidth}x${this.naturalHeight} scale=${model.scale.x.toFixed(3)} pos=${model.position.x.toFixed(1)},${model.position.y.toFixed(1)} canvas=${this.canvas.originY}/${this.canvas.ppu} textures=${model.textures.length} renderer=${this.app.renderer.type} viewport=${this.viewport().width}x${this.viewport().height}`,
@@ -283,6 +372,29 @@ export class Character {
       return true;
     }
 
+    // Try direct binding to outfits/<id>/texture_01.png first (no CSS filters)
+    try {
+      const directUrl = `${baseUrl}assets/characters/aria/outfits/${encodeURIComponent(
+        outfit.id,
+      )}/texture_01.png`;
+      const atlas = await Texture.fromURL(directUrl, {
+        scaleMode: SCALE_MODES.LINEAR,
+        mipmap: MIPMAP_MODES.ON,
+        anisotropicLevel: this.anisotropy,
+      });
+      const base = this.baseTextures[CLOTHING_TEXTURE_INDEX];
+      if (base && atlas.width === base.width && atlas.height === base.height) {
+        const textures = this.baseTextures.slice();
+        textures[CLOTHING_TEXTURE_INDEX] = atlas;
+        this.applyTextures(textures);
+        this.outfitId = outfit.id;
+        log(`outfit: ${outfit.id} (direct texture_01.png)`);
+        return true;
+      }
+    } catch (error) {
+      log(`outfit ${outfit.id} direct texture load failed, trying fallback: ${error}`);
+    }
+
     // Only the clothing page may be replaced. Everything else stays the base
     // artwork, that is what keeps the face and the hair intact.
     const clothing = outfit.textures.find(
@@ -298,7 +410,26 @@ export class Character {
     }
 
     if (!clothing) {
-      // No clothing artwork in the outfit folder: the base clothes stay on.
+      // No clothing artwork in the outfit folder: fallback to base
+      try {
+        const fallbackUrl = `${baseUrl}assets/characters/aria/base/Haru.2048/texture_01.png`;
+        const atlas = await Texture.fromURL(fallbackUrl, {
+          scaleMode: SCALE_MODES.LINEAR,
+          mipmap: MIPMAP_MODES.ON,
+          anisotropicLevel: this.anisotropy,
+        });
+        const base = this.baseTextures[CLOTHING_TEXTURE_INDEX];
+        if (base && atlas.width === base.width && atlas.height === base.height) {
+          const textures = this.baseTextures.slice();
+          textures[CLOTHING_TEXTURE_INDEX] = atlas;
+          this.applyTextures(textures);
+          this.outfitId = outfit.id;
+          log(`outfit: ${outfit.id} (fallback to base texture_01.png)`);
+          return true;
+        }
+      } catch (e) {
+        log(`outfit fallback failed: ${e}`);
+      }
       this.applyTextures(this.baseTextures);
       this.outfitId = outfit.id;
       log(
@@ -309,7 +440,26 @@ export class Character {
 
     const textures = await this.loadOutfitTextures(outfit, clothing, baseUrl);
     if (!textures) {
-      // The artwork is broken or does not fit: the outfit stays as it was.
+      // The artwork is broken or does not fit: fallback to base
+      try {
+        const fallbackUrl = `${baseUrl}assets/characters/aria/base/Haru.2048/texture_01.png`;
+        const atlas = await Texture.fromURL(fallbackUrl, {
+          scaleMode: SCALE_MODES.LINEAR,
+          mipmap: MIPMAP_MODES.ON,
+          anisotropicLevel: this.anisotropy,
+        });
+        const base = this.baseTextures[CLOTHING_TEXTURE_INDEX];
+        if (base && atlas.width === base.width && atlas.height === base.height) {
+          const texturesFallback = this.baseTextures.slice();
+          texturesFallback[CLOTHING_TEXTURE_INDEX] = atlas;
+          this.applyTextures(texturesFallback);
+          this.outfitId = outfit.id;
+          log(`outfit: ${outfit.id} (fallback to base texture_01.png after load failure)`);
+          return true;
+        }
+      } catch (e) {
+        log(`outfit fallback failed: ${e}`);
+      }
       return false;
     }
 
@@ -431,14 +581,6 @@ export class Character {
     const width = screen.width || this.app.renderer.width / this.app.renderer.resolution;
     const height = screen.height || this.app.renderer.height / this.app.renderer.resolution;
     return { width, height };
-  }
-
-  /** Makes her look at a point given in stage (css pixel) coordinates. */
-  focus(x: number, y: number): void {
-    // A non finite value would end up in the model parameters and the whole
-    // model would stop rendering, so it is filtered out here.
-    if (!Number.isFinite(x) || !Number.isFinite(y)) return;
-    this.model?.focus(x, y);
   }
 
   /** Hit test in stage coordinates, returns the names of the hit areas. */
@@ -593,6 +735,150 @@ export class Character {
     this.voiceTalking = false;
   }
 
+  // ------------------------------------------------------------ audio lip-sync
+
+  /** Builds the analyser that reads the volume of a recorded line. */
+  private initAudioLipSync(): void {
+    try {
+      if (typeof AudioContext === "undefined") return;
+      this.audioContext = new AudioContext();
+      this.analyser = this.audioContext.createAnalyser();
+      this.analyser.fftSize = 256;
+      // A little smoothing keeps single samples from snapping the mouth.
+      this.analyser.smoothingTimeConstant = 0.35;
+      this.dataArray = new Uint8Array(this.analyser.fftSize);
+      this.analyser.connect(this.audioContext.destination);
+    } catch (error) {
+      log(`audio: lip-sync is unavailable (${error})`);
+      this.audioContext = null;
+      this.analyser = null;
+      this.dataArray = null;
+    }
+  }
+
+  /**
+   * Routes the element that is playing through the analyser.
+   *
+   * Pass `null` when the line ended: the mouth falls back to the simulated
+   * rhythm and closes. The source node of an element is created once and kept,
+   * because a media element can not be attached to a second source node.
+   */
+  attachAudioLipSync(element: HTMLAudioElement | null): void {
+    if (this.currentAudioElement === element) return;
+    this.currentAudioElement = element;
+    this.useAudioMouth = false;
+
+    if (!element || !this.analyser || !this.audioContext) {
+      this.audioMouth = 0;
+      return;
+    }
+
+    try {
+      let source = this.audioSources.get(element);
+      if (!source) {
+        source = this.audioContext.createMediaElementSource(element);
+        source.connect(this.analyser);
+        this.audioSources.set(element, source);
+      }
+      if (this.audioContext.state === "suspended") {
+        void this.audioContext.resume();
+      }
+      this.useAudioMouth = true;
+    } catch (error) {
+      log(`audio: could not attach the lip-sync (${error})`);
+      this.useAudioMouth = false;
+    }
+  }
+
+  /** Root-mean-square of the line, lifted into a 0..1 mouth opening. */
+  private updateAudioMouth(): number {
+    const analyser = this.analyser;
+    const data = this.dataArray;
+    if (!analyser || !data) return 0;
+    try {
+      analyser.getByteTimeDomainData(data);
+      let sum = 0;
+      for (let i = 0; i < data.length; i++) {
+        const value = (data[i] - 128) / 128;
+        sum += value * value;
+      }
+      const rms = Math.sqrt(sum / data.length);
+      // A recorded line is quiet compared to the full scale of a sample.
+      const open = Math.min(1, rms * 6);
+      this.audioMouth += (open - this.audioMouth) * 0.5;
+      return this.audioMouth;
+    } catch {
+      return 0;
+    }
+  }
+
+  /** Starts the simulated syllable mouth of a streamed reply. */
+  startTextSpeaking(): void {
+    if (this.textSpeaking) return;
+    this.textSpeaking = true;
+    this.textPhase = 0;
+  }
+
+  /** The reply is complete: the mouth closes right away. */
+  stopTextSpeaking(): void {
+    this.textSpeaking = false;
+    // Snap mouth closed quickly when streaming ends
+    this.mouth = Math.min(this.mouth, 0.05);
+  }
+
+  /** A 4-5 Hz syllable rhythm, used while no recording is playing. */
+  private updateTextMouth(dt: number): number {
+    const rate = 4.0 + (Math.sin(this.talkClock / 850) + 1) * 0.5;
+    this.textPhase += (dt / 1000) * rate;
+    const syllable =
+      Math.sin(this.textPhase) * 0.6 + Math.sin(this.textPhase * 1.7) * 0.4;
+    return Math.max(0, syllable) * 0.85;
+  }
+
+  /** Set mouth open value directly (for TTS lip-sync). */
+  setMouthOpen(value: number): void {
+    this.mouth = Math.max(0, Math.min(1, value));
+  }
+
+  // -------------------------------------------------------------- expressions
+
+  /**
+   * Sets the expression that belongs to an emotion tag of a reply.
+   *
+   * This is not a reaction: nothing is played and no motion is started, only
+   * the face changes. It relaxes back to the default face after
+   * `EMOTION_HOLD`, which is the "graceful reset while idle" of the chat.
+   */
+  applyEmotionExpression(tag: string): void {
+    if (!this.model) return;
+    const key = tag.toLowerCase().replace(/[^a-z]/g, "");
+    if (!key || key === "neutral" || key === "calm") {
+      this.clearEmotion();
+      return;
+    }
+    const expression = EMOTION_EXPRESSIONS[key];
+    if (!expression) return;
+
+    this.expression(expression);
+    this.pendingExpression = expression;
+    window.clearTimeout(this.expressionTimer);
+    this.expressionTimer = window.setTimeout(() => {
+      this.pendingExpression = null;
+      this.clearExpression();
+      log("emotion: back to the resting face");
+    }, EMOTION_HOLD);
+    log(`emotion: [${key}] -> ${expression}`);
+  }
+
+  /** Drops the emotion expression before its hold has run out. */
+  clearEmotion(): void {
+    window.clearTimeout(this.expressionTimer);
+    this.expressionTimer = undefined;
+    if (!this.pendingExpression) return;
+    this.pendingExpression = null;
+    this.clearExpression();
+  }
+
   /**
    * Plays a reaction: a motion and an expression.
    *
@@ -606,9 +892,103 @@ export class Character {
     const now = performance.now();
     if (now - this.lastReactionAt < REACTION_COOLDOWN) return false;
     this.lastReactionAt = now;
-    if (motion) this.motion(motion, index, 3);
+    if (motion) {
+      // Prefer the requested motion; fallback to TapBody if group missing
+      try {
+        this.motion(motion, index, 3);
+      } catch {
+        try {
+          this.motion("TapBody", index, 3);
+        } catch {
+          /* ignore */
+        }
+      }
+    }
     if (expression) this.expression(expression);
     return true;
+  }
+
+  /**
+   * Starts tracking the cursor to make her head/eyes follow it.
+   *
+   * Coordinates are in stage/css pixels.
+   */
+  lookAt(x: number, y: number): void {
+    if (!this.model || !Number.isFinite(x) || !Number.isFinite(y)) return;
+    this.lastMouseMoveAt = performance.now();
+    this.mouseIdle = false;
+
+    const bounds = this.model.getBounds();
+    const cx = bounds.x + bounds.width / 2;
+    const cy = bounds.y + bounds.height / 2;
+
+    let tx = (x - cx) / (bounds.width / 2);
+    let ty = (y - cy) / (bounds.height / 2);
+
+    tx = Math.max(-1, Math.min(1, tx));
+    ty = Math.max(-1, Math.min(1, ty));
+
+    this.gazeTargetX = tx;
+    this.gazeTargetY = -ty;
+  }
+
+  /** Called when cursor leaves the window - she will return to center. */
+  lookAway(): void {
+    this.mouseIdle = true;
+    this.gazeTargetX = 0;
+    this.gazeTargetY = 0;
+  }
+
+  private initGaze(): void {
+    this.lastMouseMoveAt = performance.now();
+    this.mouseIdle = true;
+    this.gazeTargetX = 0;
+    this.gazeTargetY = 0;
+    this.gazeX = 0;
+    this.gazeY = 0;
+  }
+
+  /**
+   * Advances the smoothed gaze. Only the numbers are moved here; they are
+   * written to the model in `applyGaze`, right after the motion update.
+   */
+  private updateGaze(): void {
+    if (!this.model) return;
+    const now = performance.now();
+    if (!this.mouseIdle && now - this.lastMouseMoveAt > this.idleTimeout) {
+      this.mouseIdle = true;
+      this.gazeTargetX = 0;
+      this.gazeTargetY = 0;
+    }
+
+    const lerp = this.mouseIdle ? this.centerLerp : Math.max(0.08, this.gazeLerp);
+    this.gazeX += (this.gazeTargetX - this.gazeX) * lerp;
+    this.gazeY += (this.gazeTargetY - this.gazeY) * lerp;
+  }
+
+  /**
+   * Writes the gaze to the model.
+   *
+   * `ParamAngleX/Y` turn the head, `ParamEyeBallX/Y` move the eyes and
+   * `ParamBodyAngleX` leans the body a little into the turn. The values are
+   * written after the motion update and before physics, so the sway of the
+   * idle motion does not undo them.
+   */
+  private applyGaze(): void {
+    const model = this.model;
+    if (!model) return;
+    try {
+      const core = model.internalModel.coreModel as unknown as {
+        setParameterValueById: (id: string, value: number) => void;
+      };
+      core.setParameterValueById("ParamAngleX", this.gazeX * 30);
+      core.setParameterValueById("ParamAngleY", this.gazeY * 30);
+      core.setParameterValueById("ParamEyeBallX", this.gazeX);
+      core.setParameterValueById("ParamEyeBallY", this.gazeY);
+      core.setParameterValueById("ParamBodyAngleX", this.gazeX * 3);
+    } catch {
+      /* parameters may not exist on this model */
+    }
   }
 
   /**
@@ -630,9 +1010,11 @@ export class Character {
     const state = manager?.state;
     const expression = manager?.expressionManager?.currentExpressionIndex;
     return [
-      `talk=${this.talking || this.voiceTalking ? 1 : 0}`,
+      `talk=${this.talking || this.voiceTalking || this.textSpeaking ? 1 : 0}`,
       `voice=${this.voiceTalking ? 1 : 0}`,
       `mouth=${this.mouth.toFixed(2)}`,
+      `audio=${this.useAudioMouth ? this.audioMouth.toFixed(2) : "-"}`,
+      `gaze=${this.gazeX.toFixed(2)},${this.gazeY.toFixed(2)}`,
       `motion=${state?.currentGroup ?? "-"}:${state?.currentIndex ?? "-"}`,
       `prio=${state?.currentPriority ?? 0}`,
       `expr=${expression ?? "-"}`,
@@ -726,6 +1108,7 @@ export class Character {
    * speaking.
    */
   tick(dt: number): void {
+    this.updateGaze();
     this.updateMouth(dt);
   }
 
@@ -737,18 +1120,27 @@ export class Character {
    * over a moment instead of snapping shut.
    */
   private updateMouth(dt: number): void {
-    if (this.talking || this.voiceTalking) {
+    let open = 0;
+    if (this.useAudioMouth) {
+      // Real volume of the line that is playing.
+      open = this.updateAudioMouth();
+    } else if (this.textSpeaking) {
+      // No recording: a syllable rhythm instead, so a typed reply still has
+      // a mouth that moves with it.
+      this.talkClock += dt;
+      open = this.updateTextMouth(dt);
+    } else if (this.talking || this.voiceTalking) {
       this.talkClock += dt;
       const t = this.talkClock / 1000;
       const wave =
         Math.sin(t * TALK_FREQUENCY_A) * 0.55 +
         Math.sin(t * TALK_FREQUENCY_B + 1.1) * 0.3 +
         Math.sin(t * (TALK_FREQUENCY_A + TALK_FREQUENCY_B) * 0.6) * 0.15;
-      const open = 0.45 + 0.45 * wave;
-      this.mouth += (open - this.mouth) * Math.min(1, dt / 45);
-    } else {
-      this.mouth += (0 - this.mouth) * Math.min(1, dt / 220);
+      open = 0.45 + 0.45 * wave;
     }
+    // Opens quickly, closes a little slower, like a real mouth.
+    this.mouth +=
+      (open - this.mouth) * Math.min(1, dt / (open > this.mouth ? 45 : 160));
   }
 
   /**
@@ -877,6 +1269,15 @@ export class Character {
   }
 
   destroy(): void {
+    window.clearTimeout(this.expressionTimer);
+    this.audioSources.clear();
+    this.currentAudioElement = null;
+    if (this.audioContext) {
+      void this.audioContext.close().catch(() => undefined);
+      this.audioContext = null;
+      this.analyser = null;
+      this.dataArray = null;
+    }
     this.maskTexture?.destroy(true);
     this.maskTexture = null;
     this.maskData = null;

@@ -35,6 +35,9 @@ const result = await send("Runtime.evaluate", {
   expression,
   returnByValue: true,
   awaitPromise: true,
+  // Treat the evaluation as a click, so playback and AudioContext.resume()
+  // can be tested the same way a real tap would.
+  userGesture: true,
 });
 if (result.result?.exceptionDetails) {
   console.error(JSON.stringify(result.result.exceptionDetails, null, 2));

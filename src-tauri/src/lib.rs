@@ -1,5 +1,8 @@
 mod http;
 mod llm;
+mod local_llm;
+mod local_tts;
+mod ollama;
 mod win;
 
 use llm::{BackendInfo, ChatMsg};
@@ -82,6 +85,10 @@ pub struct AppState {
     pub config: Mutex<AppConfig>,
     /// Port of the loopback server that serves the models directory.
     pub model_port: std::sync::atomic::AtomicU16,
+    /// Child process spawned by us (Ollama)
+    pub ollama_child: Mutex<Option<std::process::Child>>,
+    /// True if we spawned ollama
+    pub ollama_spawned_by_us: std::sync::atomic::AtomicBool,
 }
 
 #[derive(Serialize, Clone, Debug)]
@@ -858,9 +865,28 @@ fn window_visible(app: AppHandle) -> bool {
         .unwrap_or(true)
 }
 
+fn cleanup_ollama(app: &AppHandle) {
+    let state = app.state::<AppState>();
+    if state
+        .ollama_spawned_by_us
+        .load(std::sync::atomic::Ordering::Relaxed)
+    {
+        if let Ok(mut child) = state.ollama_child.lock() {
+            if let Some(mut c) = child.take() {
+                let _ = c.kill();
+                let _ = c.wait();
+            }
+        }
+        state
+            .ollama_spawned_by_us
+            .store(false, std::sync::atomic::Ordering::Relaxed);
+    }
+}
+
 /// Shuts the whole app down.
 #[tauri::command]
 fn quit_app(app: AppHandle) {
+    cleanup_ollama(&app);
     app.exit(0);
 }
 
@@ -988,6 +1014,8 @@ pub fn run() {
         .manage(AppState {
             config: Mutex::new(AppConfig::default()),
             model_port: std::sync::atomic::AtomicU16::new(0),
+            ollama_child: Mutex::new(None),
+            ollama_spawned_by_us: std::sync::atomic::AtomicBool::new(false),
         })
         .invoke_handler(tauri::generate_handler![
             get_config,
@@ -1017,6 +1045,9 @@ pub fn run() {
             open_path,
             detect_backend,
             chat,
+            local_llm::list_local_models,
+            local_llm::chat_local,
+            local_tts::speak_local,
         ])
         .setup(|app| {
             let handle = app.handle().clone();
@@ -1071,6 +1102,53 @@ pub fn run() {
                 Err(e) => eprintln!("failed to start model server: {e}"),
             }
 
+            // Auto-start Ollama if not running
+            let handle_clone = handle.clone();
+            tauri::async_runtime::spawn(async move {
+                let up = ollama::is_ollama_up().await;
+                if !up {
+                    #[cfg(windows)]
+                    {
+                        use std::os::windows::process::CommandExt;
+                        const CREATE_NO_WINDOW: u32 = 0x08000000;
+                        if let Ok(child) = std::process::Command::new("ollama")
+                            .arg("serve")
+                            .creation_flags(CREATE_NO_WINDOW)
+                            .stdin(std::process::Stdio::null())
+                            .stdout(std::process::Stdio::null())
+                            .stderr(std::process::Stdio::null())
+                            .spawn()
+                        {
+                            let state2 = handle_clone.state::<AppState>();
+                            if let Ok(mut c) = state2.ollama_child.lock() {
+                                *c = Some(child);
+                            }
+                            state2
+                                .ollama_spawned_by_us
+                                .store(true, std::sync::atomic::Ordering::Relaxed);
+                        }
+                    }
+                    #[cfg(not(windows))]
+                    {
+                        if let Ok(child) = std::process::Command::new("ollama")
+                            .arg("serve")
+                            .stdin(std::process::Stdio::null())
+                            .stdout(std::process::Stdio::null())
+                            .stderr(std::process::Stdio::null())
+                            .spawn()
+                        {
+                            let state2 = handle_clone.state::<AppState>();
+                            if let Ok(mut c) = state2.ollama_child.lock() {
+                                *c = Some(child);
+                            }
+                            state2
+                                .ollama_spawned_by_us
+                                .store(true, std::sync::atomic::Ordering::Relaxed);
+                        }
+                    }
+                }
+            });
+
             // tray menu
             let toggle =
                 MenuItem::with_id(&handle, "toggle", "Show / hide character", true, None::<&str>)?;
@@ -1081,7 +1159,7 @@ pub fn run() {
                 MenuItem::with_id(&handle, "models", "Open models folder", true, None::<&str>)?;
             let config_item =
                 MenuItem::with_id(&handle, "config", "Open config folder", true, None::<&str>)?;
-            let quit = PredefinedMenuItem::quit(&handle, Some("Quit Ei Waifu"))?;
+            let quit = MenuItem::with_id(&handle, "quit", "Quit Ei Waifu", true, None::<&str>)?;
             let sep = PredefinedMenuItem::separator(&handle)?;
             let sep2 = PredefinedMenuItem::separator(&handle)?;
             let menu = Menu::with_items(
@@ -1110,6 +1188,11 @@ pub fn run() {
                 .menu(&menu)
                 .show_menu_on_left_click(false)
                 .on_menu_event(|app, event| match event.id.as_ref() {
+                    "quit" => {
+                        cleanup_ollama(app);
+                        let _ = app.emit("menu:quit", ());
+                        let _ = app.exit(0);
+                    }
                     "toggle" => {
                         if let Some(window) = app.get_webview_window(MAIN_WINDOW) {
                             let visible = window.is_visible().unwrap_or(true);
@@ -1164,6 +1247,11 @@ pub fn run() {
                 .build(app)?;
 
             Ok(())
+        })
+        .on_window_event(|window, event| {
+            if let tauri::WindowEvent::CloseRequested { .. } = event {
+                cleanup_ollama(window.app_handle());
+            }
         })
         .run(tauri::generate_context!())
         .expect("error while running ei-waifu");

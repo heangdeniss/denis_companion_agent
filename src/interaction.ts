@@ -85,8 +85,8 @@ export const REACTIONS: Record<BodyRegion, RegionReaction> = {
     ],
   },
   chest: {
-    label: "chest/ribbon",
-    motion: { group: "TapBody", index: 0 },
+    label: "chest/torso",
+    motion: { group: "Haru-pose3", index: 0 },
     expression: "F07",
     voice: "flustered",
     lines: [
@@ -97,8 +97,8 @@ export const REACTIONS: Record<BodyRegion, RegionReaction> = {
     ],
   },
   torso: {
-    label: "torso/waist",
-    motion: { group: "TapBody", index: 3 },
+    label: "chest/torso",
+    motion: { group: "Haru-pose3", index: 0 },
     expression: "F07",
     voice: "flustered",
     lines: [
@@ -123,7 +123,7 @@ export const REACTIONS: Record<BodyRegion, RegionReaction> = {
 };
 
 /** A tap inside this window is dropped, so the audio can not stack. */
-const TAP_COOLDOWN = 1900;
+const TAP_COOLDOWN = 1500;
 /** The reaction expression is put back after this long. */
 const EXPRESSION_HOLD = 3600;
 
@@ -218,8 +218,12 @@ export class Interaction {
     this.options.say(line);
 
     const spoken = this.options.voice.say(reaction.voice, {
+      onElement: (element) => this.options.character.attachAudioLipSync(element),
       onStart: () => this.options.character.startVoiceTalking(),
-      onEnd: () => this.options.character.stopVoiceTalking(),
+      onEnd: () => {
+        this.options.character.attachAudioLipSync(null);
+        this.options.character.stopVoiceTalking();
+      },
     });
     if (!spoken) {
       // There is no recording for this region: the mouth still moves while

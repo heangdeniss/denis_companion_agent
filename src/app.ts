@@ -1,13 +1,15 @@
 import { listen } from "@tauri-apps/api/event";
 import { Application, UPDATE_PRIORITY } from "pixi.js";
 import { Character } from "./character";
-import { Chat } from "./chat";
+import { Chat, extractEmotionTag } from "./chat";
 import { Interaction } from "./interaction";
 import { api } from "./ipc";
 import { log } from "./logger";
 import { groupOutfits, mergeOutfits, DEFAULT_OUTFIT } from "./outfits";
 import type { AppConfig, Rect } from "./types";
 import { Voice } from "./voice";
+import { tts, isMuted } from "./tts";
+import { addMemory, getTimeGreeting, checkBattery } from "./memory";
 
 const POLL_INTERVAL = 40;
 /** How often the silhouette is handed over to the native hit test (ms). */
@@ -55,6 +57,11 @@ export async function bootstrap(): Promise<void> {
   const menuOutfit = document.getElementById("menu-outfit") as HTMLButtonElement;
   const menuSize = document.getElementById("menu-size") as HTMLButtonElement;
   const menuQuit = document.getElementById("menu-quit") as HTMLButtonElement;
+  const menuVoice = document.createElement("button");
+  menuVoice.type = "button";
+  menuVoice.className = "menu-item";
+  menuVoice.textContent = isMuted() ? "Unmute Voice" : "Mute Voice";
+  menuEl.insertBefore(menuVoice, menuQuit);
   const outfitPanel = document.getElementById("outfit-panel") as HTMLElement;
   const outfitList = document.getElementById("outfit-list") as HTMLDivElement;
   const gripEl = document.getElementById("resize-grip") as HTMLDivElement;
@@ -101,7 +108,7 @@ export async function bootstrap(): Promise<void> {
   // A small hook for the asset tooling and the dev tools of the webview: it
   // makes the live model reachable, which is how the UV layout of the texture
   // atlases is read while an outfit is painted.
-  (window as unknown as { ei: unknown }).ei = { app, character };
+  (window as unknown as { ei: unknown }).ei = { app, character, tts };
 
   // ---------------------------------------------------------------- model
   const models = await api.listModels();
@@ -331,6 +338,103 @@ export async function bootstrap(): Promise<void> {
     void pushUiRects();
   }
 
+  // ---------------------------------------------------------------- ollama auto-connect
+  const chatStatusEl = document.getElementById("chat-status") as HTMLDivElement | null;
+  function setChatStatusText(text: string, isError = false): void {
+    if (!chatStatusEl) return;
+    chatStatusEl.textContent = text;
+    chatStatusEl.classList.toggle("error", isError);
+    chatStatusEl.title = text;
+  }
+
+  async function waitForOllama(maxMs = 10000): Promise<{
+    online: boolean;
+    model: string;
+  }> {
+    const start = Date.now();
+    let delay = 500;
+    while (Date.now() - start < maxMs) {
+      try {
+        const res = await fetch("http://127.0.0.1:11434/api/version", {
+          method: "GET",
+          cache: "no-store",
+        });
+        if (res.ok) {
+          // try to get model
+          try {
+            const r2 = await fetch("http://127.0.0.1:11434/api/tags", {
+              cache: "no-store",
+            });
+            if (r2.ok) {
+              const j = await r2.json();
+              const models = Array.isArray(j?.models) ? j.models : [];
+              const name =
+                models[0]?.name ||
+                models[0]?.model ||
+                config.llmModel ||
+                "ollama";
+              return { online: true, model: name };
+            }
+          } catch {}
+          return { online: true, model: config.llmModel || "ollama" };
+        }
+      } catch {}
+      await new Promise((r) => setTimeout(r, delay));
+      delay = Math.min(delay * 1.4, 2000);
+    }
+    return { online: false, model: "" };
+  }
+
+  setChatStatusText("Starting LLM server...");
+  void (async () => {
+    const res = await waitForOllama(10000);
+    if (res.online) {
+      setChatStatusText(`Connected to ollama (${res.model})`);
+    } else {
+      setChatStatusText("Failed to connect to LLM server. Click to retry.", true);
+      if (chatStatusEl) {
+        chatStatusEl.style.cursor = "pointer";
+        chatStatusEl.onclick = () => {
+          setChatStatusText("Starting LLM server...");
+          chatStatusEl.onclick = null;
+          chatStatusEl.style.cursor = "";
+          void (async () => {
+            const r = await waitForOllama(10000);
+            if (r.online) {
+              setChatStatusText(`Connected to ollama (${r.model})`);
+            } else {
+              setChatStatusText(
+                "Failed to connect to LLM server. Click to retry.",
+                true,
+              );
+              if (chatStatusEl) {
+                chatStatusEl.style.cursor = "pointer";
+                chatStatusEl.onclick = () => {
+                  setChatStatusText("Starting LLM server...");
+                  chatStatusEl.onclick = null;
+                  chatStatusEl.style.cursor = "";
+                  void (async () => {
+                    const rr = await waitForOllama(10000);
+                    if (rr.online)
+                      setChatStatusText(`Connected to ollama (${rr.model})`);
+                    else {
+                      setChatStatusText(
+                        "Failed to connect to LLM server. Click to retry.",
+                        true,
+                      );
+                      chatStatusEl.onclick = null;
+                      chatStatusEl.style.cursor = "";
+                    }
+                  })();
+                };
+              }
+            }
+          })();
+        };
+      }
+    }
+  })();
+
   // ---------------------------------------------------------------- chat
   const chat = new Chat(config, {
     // The tokens only fill the bubble. They must not touch the animation:
@@ -338,18 +442,46 @@ export async function bootstrap(): Promise<void> {
     // is talking.
     onDelta: (text) => {
       character.startTalking();
-      showBubble(text, Math.max(4, config.bubbleSeconds));
+      character.startTextSpeaking();
+      const { text: display } = extractEmotionTag(text);
+      // The tag alone is not a line: the bubble waits for the first words.
+      if (display.trim()) {
+        showBubble(display, Math.max(4, config.bubbleSeconds));
+      }
     },
     onDone: (full) => {
       character.stopTalking();
+      character.stopTextSpeaking();
       if (full.trim()) {
-        logMessage(full.trim(), "her");
-        showBubble(full.trim(), Math.max(4, config.bubbleSeconds));
+        const { tag, text: display } = extractEmotionTag(full.trim());
+        if (tag) {
+          character.applyEmotionExpression(tag);
+        }
+        logMessage(display, "her");
+        showBubble(display, Math.max(4, config.bubbleSeconds));
+        try {
+          addMemory({ role: "assistant", content: display });
+        } catch {}
+        // Speak with TTS and lip-sync
+        tts.speak(full, {
+          onStart: () => {
+            character.startVoiceTalking();
+          },
+          onEnd: () => {
+            character.stopVoiceTalking();
+            character.setMouthOpen(0);
+          },
+          onMouth: (v) => {
+            character.setMouthOpen(v);
+          },
+        });
       }
       void api.setConfig(config);
     },
     onError: (message) => {
       character.stopTalking();
+      character.stopTextSpeaking();
+      character.clearEmotion();
       // The retry loop goes back to the fast cadence so a restarted server is
       // picked up on its own.
       backendOnline = false;
@@ -365,6 +497,9 @@ export async function bootstrap(): Promise<void> {
     if (!text.trim()) return;
     chatInput.value = "";
     logMessage(text, "user");
+    try {
+      addMemory({ role: "user", content: text });
+    } catch {}
     void chat.send(text);
   });
 
@@ -429,6 +564,13 @@ export async function bootstrap(): Promise<void> {
     config.windowHeight = 0;
     void applyAutoSize();
     void api.setConfig(config);
+  });
+
+  menuVoice.addEventListener("click", () => {
+    const muted = !tts.getMuted();
+    tts.setMuted(muted);
+    menuVoice.textContent = muted ? "Unmute Voice" : "Mute Voice";
+    closeMenu();
   });
 
   menuQuit.addEventListener("click", () => {
@@ -683,6 +825,17 @@ export async function bootstrap(): Promise<void> {
     if (overUi(x, y)) return;
     if (!overCharacter(x, y)) return;
 
+    // Shift+Left click to drag window
+    if (event.shiftKey) {
+      try {
+        const { getCurrentWindow } = await import("@tauri-apps/api/window");
+        await getCurrentWindow().startDragging();
+        return;
+      } catch (e) {
+        log(`drag failed: ${e}`);
+      }
+    }
+
     // The drag origin has to be known *before* the button is considered down,
     // otherwise the poll loop can start dragging the window with stale values
     // and the window jumps to the cursor.
@@ -716,6 +869,16 @@ export async function bootstrap(): Promise<void> {
 
     if (!pointerMoved) {
       handleTap(event.clientX, event.clientY);
+    } else {
+      // Save position after drag
+      try {
+        const { getCurrentWindow } = await import("@tauri-apps/api/window");
+        const pos = await getCurrentWindow().outerPosition();
+        localStorage.setItem(
+          "eiwaifu:windowPos",
+          JSON.stringify({ x: pos.x, y: pos.y }),
+        );
+      } catch {}
     }
   });
 
@@ -939,7 +1102,16 @@ export async function bootstrap(): Promise<void> {
       const sx = (cursor.x - bounds.x) / bounds.scaleFactor;
       const sy = (cursor.y - bounds.y) / bounds.scaleFactor;
 
-      character.focus(sx, sy);
+      // Only a cursor that is really inside the overlay is followed. Outside
+      // of it she looks back to the centre, so she is not staring at the edge
+      // of the screen while the user works somewhere else.
+      const inside =
+        sx >= 0 && sy >= 0 && sx <= window.innerWidth && sy <= window.innerHeight;
+      if (inside) {
+        character.lookAt(sx, sy);
+      } else {
+        character.lookAway();
+      }
 
       if (!nativeHitTest && !pointerDown) {
         const active =
@@ -989,6 +1161,20 @@ export async function bootstrap(): Promise<void> {
     await api.setHitEnabled(config.clickThrough);
   }
 
+  // Restore window position if saved
+  try {
+    const saved = localStorage.getItem("eiwaifu:windowPos");
+    if (saved) {
+      const pos = JSON.parse(saved);
+      if (typeof pos.x === "number" && typeof pos.y === "number") {
+        try {
+          const { getCurrentWindow } = await import("@tauri-apps/api/window");
+          await getCurrentWindow().setPosition({ type: "Physical", x: pos.x, y: pos.y } as any);
+        } catch {}
+      }
+    }
+  } catch {}
+
   // She wears the outfit of the last session. An outfit whose artwork is gone
   // falls back to the default one.
   await applyOutfit(config.selectedOutfit || DEFAULT_OUTFIT, true);
@@ -1005,11 +1191,30 @@ export async function bootstrap(): Promise<void> {
   await refreshBackend(true);
   watchBackend();
 
-  if (config.greetOnStart) {
-    const line = pick(GREETINGS);
-    chat.say(line);
-    showBubble(line);
+  // Time-aware greetings
+  try {
+    const tg = getTimeGreeting();
+    if (tg) {
+      chat.say(tg);
+      showBubble(tg);
+    } else if (config.greetOnStart) {
+      const line = pick(GREETINGS);
+      chat.say(line);
+      showBubble(line);
+    }
+  } catch {
+    if (config.greetOnStart) {
+      const line = pick(GREETINGS);
+      chat.say(line);
+      showBubble(line);
+    }
   }
+
+  // Battery check
+  void checkBattery((msg) => {
+    showToast(msg);
+    chat.say(msg);
+  });
 
   // A heartbeat makes it easy to see from the log that the render loop and
   // the model are still alive.

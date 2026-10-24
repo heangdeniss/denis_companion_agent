@@ -26,6 +26,13 @@ const DEFAULT_VOLUME = 0.85;
 const FALLBACK_LINE = "line1.wav";
 
 interface VoiceHooks {
+  /**
+   * Called with the element that is about to play, before it starts.
+   *
+   * This runs inside the click that started the line, which is the moment the
+   * audio context may be resumed by the browser.
+   */
+  onElement?: (element: HTMLAudioElement) => void;
   /** Called when the line is really audible (not just started). */
   onStart?: () => void;
   /** Called when the line ended, failed or was stopped. */
@@ -64,6 +71,16 @@ export class Voice {
     return this.current !== null;
   }
 
+  /**
+   * The element that is playing right now, or null.
+   *
+   * The lip-sync needs the same element the sound comes from: an analyser on a
+   * different element would read silence.
+   */
+  get element(): HTMLAudioElement | null {
+    return this.current?.audio ?? null;
+  }
+
   /** Number of lines that were found, for the boot log. */
   get lineCount(): number {
     let count = 0;
@@ -90,7 +107,12 @@ export class Voice {
       for (const file of files) {
         const url =
           this.root + file.split("/").map(encodeURIComponent).join("/");
-        const audio = new Audio(url);
+        // The sounds come from the asset server, the page from another origin.
+        // The anonymous flag makes the media request CORS-enabled, which is
+        // what the lip-sync analyser needs to be allowed to read it.
+        const audio = new Audio();
+        audio.crossOrigin = "anonymous";
+        audio.src = url;
         audio.preload = "auto";
         audio.volume = this.volume;
         try {
@@ -134,6 +156,14 @@ export class Voice {
 
     const audio = clip.audio;
     audio.volume = this.volume;
+    // The tap that starts the line is still a user gesture here, which is the
+    // only moment the AudioContext may be resumed. Doing this before `play`
+    // also means the mouth is ready for the first syllable.
+    try {
+      hooks.onElement?.(audio);
+    } catch (error) {
+      log(`voice: the lip-sync hook failed (${error})`);
+    }
     audio.onplaying = () => {
       if (token === this.token) this.hooks.onStart?.();
     };
