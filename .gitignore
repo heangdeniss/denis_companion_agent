@@ -5,3 +5,9 @@ src-tauri/target/
 *.log
 .DS_Store
 Thumbs.db
+
+# Local inference assets are big binaries, they are installed next to the app
+# rather than committed to the repository.
+models/*.gguf
+models/llama/
+models/tts/

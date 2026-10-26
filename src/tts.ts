@@ -1,3 +1,4 @@
+import { api } from "./ipc";
 import { log } from "./logger";
 
 export type TTSOptions = {
@@ -27,22 +28,35 @@ export function isMuted(): boolean {
 }
 
 function stripEmotionTags(text: string): string {
-  // Remove leading emotion tags like [happy] [blush] etc
   let t = text;
+  // Remove a leading emotion tag, then any other simple tags in the line.
   t = t.replace(/^\s*\[[a-zA-Z]+\]\s*/g, "");
-  // Also strip any remaining simple tags
   t = t.replace(/\[[a-zA-Z]+\]/g, "");
   return t.trim();
 }
 
+/**
+ * Speaks a line with the in-folder Piper voice when it is available and falls
+ * back to the system voices otherwise.
+ *
+ * Both paths go through the same `AnalyserNode`, so `ParamMouthOpenY` is driven
+ * by the actual audio instead of a guess. The procedural mouth in `character.ts`
+ * stays in charge while a reply is still streaming.
+ */
 export class TTS {
   private synth = typeof window !== "undefined" ? window.speechSynthesis : null;
   private audioContext: AudioContext | null = null;
   private analyser: AnalyserNode | null = null;
   private dataArray: Uint8Array<ArrayBuffer> | null = null;
+  private source: AudioBufferSourceNode | null = null;
   private raf: number | null = null;
   private speaking = false;
+  /** The system voice is not routed through WebAudio, so the analyser would
+   * read silence. In that case the mouth is driven procedurally instead. */
+  private proceduralMouth = false;
   private muted = getMuted();
+  /** Bumped on every stop, so a late async result cannot start stale audio. */
+  private token = 0;
 
   isSpeaking(): boolean {
     return this.speaking;
@@ -51,9 +65,7 @@ export class TTS {
   setMuted(muted: boolean): void {
     this.muted = muted;
     setMuted(muted);
-    if (muted) {
-      this.stop();
-    }
+    if (muted) this.stop();
   }
 
   getMuted(): boolean {
@@ -91,15 +103,22 @@ export class TTS {
         return;
       }
       try {
-        this.analyser.getByteTimeDomainData(this.dataArray);
-        let sum = 0;
-        for (let i = 0; i < this.dataArray.length; i++) {
-          const v = (this.dataArray[i] - 128) / 128;
-          sum += v * v;
+        if (this.proceduralMouth) {
+          const t = performance.now() / 1000;
+          const open = 0.42 + 0.3 * Math.sin(t * 2 * Math.PI * 4.5);
+          onMouth(Math.max(0.05, Math.min(0.85, open)));
+        } else {
+          this.analyser.getByteTimeDomainData(this.dataArray);
+          let sum = 0;
+          for (let i = 0; i < this.dataArray.length; i++) {
+            const v = (this.dataArray[i] - 128) / 128;
+            sum += v * v;
+          }
+          const rms = Math.sqrt(sum / this.dataArray.length);
+          // Speech has short gaps: a little lift keeps the mouth visibly moving.
+          const open = Math.min(1, rms * 7.5);
+          onMouth(open);
         }
-        const rms = Math.sqrt(sum / this.dataArray.length);
-        const open = Math.min(1, rms * 7);
-        onMouth(open);
       } catch {}
       this.raf = requestAnimationFrame(loop);
     };
@@ -115,30 +134,73 @@ export class TTS {
     if (onMouth) onMouth(0);
   }
 
-  speak(text: string, options: TTSOptions = {}): void {
-    if (this.muted) {
-      options.onStart?.();
-      // still allow procedural lip sync via text if needed? just skip audio
-      options.onEnd?.();
-      return;
+  /**
+   * Renders the line with Piper inside the app and plays the returned WAV.
+   * Returns false when the local stack is not installed, so the caller can
+   * fall back to the system voice.
+   */
+  private async speakLocal(
+    text: string,
+    options: TTSOptions,
+    token: number,
+  ): Promise<boolean> {
+    let url = "";
+    try {
+      url = await api.speakLocal(text);
+    } catch (e) {
+      log(`tts: local voice failed ${e}`);
+      return false;
     }
-    if (!this.synth) {
+    if (token !== this.token) return true;
+    if (!url || !url.startsWith("data:audio")) return false;
+
+    this.ensureAudio();
+    const ctx = this.audioContext;
+    const analyser = this.analyser;
+    if (!ctx || !analyser) return false;
+
+    try {
+      if (ctx.state === "suspended") await ctx.resume();
+      const response = await fetch(url);
+      const data = await response.arrayBuffer();
+      const buffer = await ctx.decodeAudioData(data);
+      if (token !== this.token) return true;
+
+      const source = ctx.createBufferSource();
+      source.buffer = buffer;
+      source.connect(analyser);
+      this.source = source;
+
+      this.speaking = true;
       options.onStart?.();
+      this.proceduralMouth = false;
+      this.startLipSync(options.onMouth);
+
+      source.onended = () => {
+        if (this.source !== source) return;
+        this.source = null;
+        this.speaking = false;
+        this.stopLipSync(options.onMouth);
+        options.onEnd?.();
+      };
+      source.start();
+      return true;
+    } catch (e) {
+      log(`tts: local playback failed ${e}`);
+      return false;
+    }
+  }
+
+  private speakSystem(text: string, options: TTSOptions): void {
+    if (!this.synth) {
       options.onEnd?.();
       return;
     }
     try {
-      this.stop();
-      const cleaned = stripEmotionTags(text);
-      if (!cleaned) {
-        options.onEnd?.();
-        return;
-      }
-      const utter = new SpeechSynthesisUtterance(cleaned);
+      const utter = new SpeechSynthesisUtterance(text);
       utter.rate = 1.0;
       utter.pitch = 1.15;
       utter.volume = 1.0;
-      // Try to pick a female/anime voice
       const voices = this.synth.getVoices();
       const preferred = voices.find(
         (v) =>
@@ -146,9 +208,11 @@ export class TTS {
           /en-US/i.test(v.lang),
       );
       if (preferred) utter.voice = preferred;
+
       this.speaking = true;
       utter.onstart = () => {
         options.onStart?.();
+        this.proceduralMouth = true;
         this.startLipSync(options.onMouth);
         if (this.audioContext?.state === "suspended") {
           void this.audioContext.resume();
@@ -171,12 +235,38 @@ export class TTS {
     }
   }
 
+  speak(text: string, options: TTSOptions = {}): void {
+    const cleaned = stripEmotionTags(text);
+    if (this.muted || !cleaned) {
+      // No audio, but the caller still wants to know that the line is over.
+      options.onStart?.();
+      options.onEnd?.();
+      return;
+    }
+
+    this.stop();
+    const token = this.token;
+
+    void this.speakLocal(cleaned, options, token).then((ok) => {
+      if (ok || token !== this.token) return;
+      log("tts: local voice unavailable, using system voice");
+      this.speakSystem(cleaned, options);
+    });
+  }
+
   stop(): void {
+    this.token++;
     try {
-      if (this.synth) {
-        this.synth.cancel();
-      }
+      if (this.synth) this.synth.cancel();
     } catch {}
+    if (this.source) {
+      try {
+        this.source.onended = null;
+        this.source.stop();
+        this.source.disconnect();
+      } catch {}
+      this.source = null;
+    }
     this.speaking = false;
     this.stopLipSync();
   }

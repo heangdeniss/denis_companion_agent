@@ -89,6 +89,8 @@ pub struct AppState {
     pub ollama_child: Mutex<Option<std::process::Child>>,
     /// True if we spawned ollama
     pub ollama_spawned_by_us: std::sync::atomic::AtomicBool,
+    /// Child process of the bundled llama-server, if we started one.
+    pub local_child: Mutex<Option<std::process::Child>>,
 }
 
 #[derive(Serialize, Clone, Debug)]
@@ -118,6 +120,39 @@ pub struct WindowBounds {
 
 fn config_path(app: &AppHandle) -> Option<PathBuf> {
     app.path().app_config_dir().ok().map(|d| d.join("config.json"))
+}
+
+/// The conversation memory lives next to the config, so it survives restarts
+/// and is shared between a dev run and the packaged app.
+fn memory_path(app: &AppHandle) -> Result<PathBuf, String> {
+    let dir = app
+        .path()
+        .app_data_dir()
+        .map_err(|e| format!("no app data folder: {e}"))?;
+    fs::create_dir_all(&dir).map_err(|e| format!("could not create app data folder: {e}"))?;
+    Ok(dir.join("memory.json"))
+}
+
+#[tauri::command]
+fn load_memory(app: AppHandle) -> Result<serde_json::Value, String> {
+    let path = memory_path(&app)?;
+    if !path.exists() {
+        return Ok(serde_json::Value::Array(Vec::new()));
+    }
+    let text = fs::read_to_string(&path).map_err(|e| e.to_string())?;
+    let value: serde_json::Value = serde_json::from_str(&text).map_err(|e| e.to_string())?;
+    if value.is_array() {
+        Ok(value)
+    } else {
+        Ok(serde_json::Value::Array(Vec::new()))
+    }
+}
+
+#[tauri::command]
+fn save_memory(app: AppHandle, entries: serde_json::Value) -> Result<(), String> {
+    let path = memory_path(&app)?;
+    let text = serde_json::to_string_pretty(&entries).map_err(|e| e.to_string())?;
+    fs::write(&path, text).map_err(|e| e.to_string())
 }
 
 fn load_config(app: &AppHandle) -> AppConfig {
@@ -883,10 +918,15 @@ fn cleanup_ollama(app: &AppHandle) {
     }
 }
 
+fn cleanup_local_model(app: &AppHandle) {
+    local_llm::kill(app);
+}
+
 /// Shuts the whole app down.
 #[tauri::command]
 fn quit_app(app: AppHandle) {
     cleanup_ollama(&app);
+    cleanup_local_model(&app);
     app.exit(0);
 }
 
@@ -908,8 +948,14 @@ fn open_path(_app: AppHandle, path: String) -> Result<(), String> {
 
 #[tauri::command]
 async fn detect_backend(
+    app: AppHandle,
     state: State<'_, AppState>,
 ) -> Result<BackendInfo, String> {
+    // The in-folder model is preferred: it needs no installation and is the
+    // fastest path for a machine that has the `models/` folder populated.
+    if let Some(info) = local_llm::ready_backend(&app).await {
+        return Ok(info);
+    }
     let cfg = state.config.lock().unwrap().clone();
     Ok(llm::detect_backends(&cfg).await)
 }
@@ -920,6 +966,24 @@ async fn chat(
     state: State<'_, AppState>,
     messages: Vec<ChatMsg>,
 ) -> Result<(), String> {
+    // Prefer the bundled model. `ensure_started` loads it on the first message
+    // and reports an error only if the local stack is incomplete, in which
+    // case the normal Ollama/LM Studio detection runs below.
+    if let Ok(backend) = local_llm::ensure_started(&app).await {
+        let handle = app.clone();
+        tauri::async_runtime::spawn(async move {
+            match local_llm::stream_chat(handle.clone(), messages, backend).await {
+                Ok(()) => {
+                    let _ = handle.emit("chat:done", "local");
+                }
+                Err(e) => {
+                    let _ = handle.emit("chat:error", e);
+                }
+            }
+        });
+        return Ok(());
+    }
+
     let cfg = state.config.lock().unwrap().clone();
     let backend = llm::detect_backends(&cfg).await;
     // A reachable server is not enough: a missing model is reported as an
@@ -1016,6 +1080,7 @@ pub fn run() {
             model_port: std::sync::atomic::AtomicU16::new(0),
             ollama_child: Mutex::new(None),
             ollama_spawned_by_us: std::sync::atomic::AtomicBool::new(false),
+            local_child: Mutex::new(None),
         })
         .invoke_handler(tauri::generate_handler![
             get_config,
@@ -1046,8 +1111,11 @@ pub fn run() {
             detect_backend,
             chat,
             local_llm::list_local_models,
-            local_llm::chat_local,
+            local_llm::local_status,
             local_tts::speak_local,
+            local_tts::tts_available,
+            load_memory,
+            save_memory,
         ])
         .setup(|app| {
             let handle = app.handle().clone();
@@ -1102,9 +1170,15 @@ pub fn run() {
                 Err(e) => eprintln!("failed to start model server: {e}"),
             }
 
-            // Auto-start Ollama if not running
+            // Prefer the model that lives inside the project. When it is there
+            // the bundled llama-server is started instead of Ollama, so the
+            // app works with nothing installed on the machine.
             let handle_clone = handle.clone();
             tauri::async_runtime::spawn(async move {
+                if local_llm::is_installed(&handle_clone) {
+                    local_llm::autostart(handle_clone.clone());
+                    return;
+                }
                 let up = ollama::is_ollama_up().await;
                 if !up {
                     #[cfg(windows)]
@@ -1190,6 +1264,7 @@ pub fn run() {
                 .on_menu_event(|app, event| match event.id.as_ref() {
                     "quit" => {
                         cleanup_ollama(app);
+                        cleanup_local_model(app);
                         let _ = app.emit("menu:quit", ());
                         let _ = app.exit(0);
                     }
@@ -1251,6 +1326,7 @@ pub fn run() {
         .on_window_event(|window, event| {
             if let tauri::WindowEvent::CloseRequested { .. } = event {
                 cleanup_ollama(window.app_handle());
+                cleanup_local_model(window.app_handle());
             }
         })
         .run(tauri::generate_context!())

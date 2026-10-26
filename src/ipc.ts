@@ -55,6 +55,6 @@ export const api = {
   detectBackend: () => invoke<BackendInfo>("detect_backend"),
   chat: (messages: ChatMsg[]) => invoke<void>("chat", { messages }),
   listLocalModels: () => invoke<string[]>("list_local_models").catch(() => [] as string[]),
-  chatLocal: (config: AppConfig, messages: ChatMsg[]) => invoke<void>("chat_local", { config, messages }),
   speakLocal: (text: string) => invoke<string>("speak_local", { text }).catch(() => ""),
+  ttsAvailable: () => invoke<boolean>("tts_available").catch(() => false),
 };

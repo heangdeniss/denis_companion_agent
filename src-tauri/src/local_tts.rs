@@ -1,143 +1,166 @@
+//! Local text-to-speech with Piper.
+//!
+//! The voice model (`models/tts/*.onnx`) and the small `piper.exe` runtime live
+//! inside the project, so no cloud service and no extra installation is
+//! needed. The audio is returned to the webview as a `data:` URL and played
+//! through an `AudioContext`, which is what drives the lip-sync analyser.
+
 use base64::{engine::general_purpose, Engine as _};
-use hound::{WavSpec, WavWriter};
-use ort::session::{builder::GraphOptimizationLevel, Session};
-use ort::value::Tensor;
-use serde_json::Value;
 use std::fs;
-use std::path::PathBuf;
-use std::sync::{Arc, Mutex};
-use std::io::Cursor;
+use std::io::Write;
+use std::path::{Path, PathBuf};
+use std::process::{Command, Stdio};
+use std::time::{SystemTime, UNIX_EPOCH};
+use tauri::{AppHandle, Manager};
 
-#[derive(Clone)]
-struct TTSState {
-    session: Option<Arc<Session>>,
-    config: Option<Value>,
-}
+#[cfg(windows)]
+use std::os::windows::process::CommandExt;
+#[cfg(windows)]
+const CREATE_NO_WINDOW: u32 = 0x08000000;
 
-static TTS_STATE: std::sync::OnceLock<Arc<Mutex<TTSState>>> = std::sync::OnceLock::new();
+fn search_dirs(app: &AppHandle) -> Vec<PathBuf> {
+    let mut dirs: Vec<PathBuf> = Vec::new();
 
-fn get_state() -> Arc<Mutex<TTSState>> {
-    TTS_STATE
-        .get_or_init(|| {
-            Arc::new(Mutex::new(TTSState {
-                session: None,
-                config: None,
-            }))
-        })
-        .clone()
-}
-
-fn find_piper(app: &tauri::AppHandle) -> Option<(PathBuf, PathBuf)> {
-    // look for .onnx + .json in models/tts
-    let mut search_dirs = Vec::new();
     if let Ok(cwd) = std::env::current_dir() {
-        search_dirs.push(cwd.join("models").join("tts"));
-        search_dirs.push(cwd.join("models"));
+        dirs.push(cwd.join("models").join("tts"));
+        dirs.push(cwd.join("..").join("models").join("tts"));
     }
     if let Ok(exe) = std::env::current_exe() {
-        if let Some(dir) = exe.parent() {
-            let mut cur = dir.to_path_buf();
-            for _ in 0..5 {
-                search_dirs.push(cur.join("models").join("tts"));
-                search_dirs.push(cur.join("models"));
-                if let Some(p) = cur.parent() {
-                    cur = p.to_path_buf();
-                } else {
-                    break;
-                }
-            }
+        let mut cur = exe.parent().map(|p| p.to_path_buf());
+        while let Some(dir) = cur {
+            dirs.push(dir.join("models").join("tts"));
+            cur = dir.parent().map(|p| p.to_path_buf());
         }
     }
     if let Ok(res) = app.path().resource_dir() {
-        search_dirs.push(res.join("models").join("tts"));
-        search_dirs.push(res.join("models"));
+        dirs.push(res.join("models").join("tts"));
     }
-    for d in search_dirs {
-        if !d.exists() {
+    dirs
+}
+
+fn find_piper(app: &AppHandle) -> Option<(PathBuf, PathBuf)> {
+    for dir in search_dirs(app) {
+        if !dir.exists() {
             continue;
         }
-        if let Ok(entries) = fs::read_dir(&d) {
-            for e in entries.flatten() {
-                let p = e.path();
-                if p.extension().and_then(|x| x.to_str()) == Some("onnx") {
-                    let json = p.with_extension("onnx.json");
-                    if json.exists() {
-                        return Some((p, json));
-                    }
-                }
-            }
+        let Some(exe) = [dir.join("piper").join("piper.exe"), dir.join("piper.exe")]
+            .into_iter()
+            .find(|p| p.is_file())
+        else {
+            continue;
+        };
+
+        let Ok(entries) = fs::read_dir(&dir) else {
+            continue;
+        };
+        let mut voices: Vec<PathBuf> = entries
+            .flatten()
+            .map(|e| e.path())
+            .filter(|p| {
+                p.is_file()
+                    && p.extension()
+                        .and_then(|e| e.to_str())
+                        .map(|e| e.eq_ignore_ascii_case("onnx"))
+                        .unwrap_or(false)
+            })
+            .collect();
+        voices.sort();
+        if let Some(model) = voices.into_iter().next() {
+            return Some((exe, model));
         }
     }
     None
 }
 
-fn ensure_loaded(app: &tauri::AppHandle) -> Result<(), String> {
-    let (onnx, json) = find_piper(app).ok_or("No Piper model found in models/tts/")?;
-    let mut st = get_state().lock().map_err(|e| e.to_string())?;
-    // simple check
-    if st.session.is_some() {
-        return Ok(());
+pub fn available(app: &AppHandle) -> bool {
+    find_piper(app).is_some()
+}
+
+fn synth(app: &AppHandle, text: &str) -> Result<String, String> {
+    let (exe, model) = find_piper(app).ok_or("Piper voice is not installed")?;
+
+    let stamp = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_millis())
+        .unwrap_or(0);
+    let out = std::env::temp_dir().join(format!("eiwaifu-{stamp}.wav"));
+
+    let mut cmd = Command::new(&exe);
+    cmd.arg("--model")
+        .arg(&model)
+        .arg("--output_file")
+        .arg(&out)
+        // A slightly slower, softer delivery suits the character.
+        .arg("--length_scale")
+        .arg("1.05")
+        .arg("--noise_scale")
+        .arg("0.667")
+        .arg("--noise_w")
+        .arg("0.8")
+        .arg("--sentence_silence")
+        .arg("0.2")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null());
+
+    // The espeak data and the DLLs are found next to piper.exe.
+    if let Some(parent) = exe.parent() {
+        cmd.current_dir(parent);
     }
-    let session = Session::builder()
-        .map_err(|e| e.to_string())?
-        .with_optimization_level(GraphOptimizationLevel::Level3)
-        .map_err(|e| e.to_string())?
-        .with_intra_threads(4)
-        .map_err(|e| e.to_string())?
-        .commit_from_file(&onnx)
-        .map_err(|e| e.to_string())?;
-    let cfg: Value = serde_json::from_str(&fs::read_to_string(&json).map_err(|e| e.to_string())?)
-        .map_err(|e| e.to_string())?;
-    st.session = Some(Arc::new(session));
-    st.config = Some(cfg);
-    Ok(())
+    #[cfg(windows)]
+    cmd.creation_flags(CREATE_NO_WINDOW);
+
+    let mut child = cmd
+        .spawn()
+        .map_err(|e| format!("could not start piper: {e}"))?;
+
+    if let Some(stdin) = child.stdin.as_mut() {
+        stdin
+            .write_all(text.as_bytes())
+            .map_err(|e| format!("could not send text to piper: {e}"))?;
+    }
+    // Closing stdin tells piper that the text is complete.
+    drop(child.stdin.take());
+
+    let status = child.wait().map_err(|e| e.to_string())?;
+    if !status.success() {
+        let _ = fs::remove_file(&out);
+        return Err("piper failed to synthesize the line".into());
+    }
+
+    let bytes = fs::read(&out).map_err(|e| format!("could not read the voice file: {e}"))?;
+    let _ = fs::remove_file(&out);
+
+    if bytes.len() < 64 {
+        return Err("piper produced an empty voice file".into());
+    }
+
+    let encoded = general_purpose::STANDARD.encode(bytes);
+    Ok(format!("data:audio/wav;base64,{encoded}"))
 }
 
 #[tauri::command]
-pub async fn speak_local(app: tauri::AppHandle, text: String) -> Result<String, String> {
-    ensure_loaded(&app)?;
-    let st = get_state().lock().map_err(|e| e.to_string())?;
-    let session = st.session.as_ref().cloned().ok_or("TTS not loaded")?;
-    let _config = st.config.clone();
-    drop(st);
-    
-    // Very basic Piper inference - simplified for compatibility
-    // For a proper implementation we'd need phonemization; this is a fallback approach
-    // Try to use a simple method
-    let mut sess = (*session).clone();
-    
-    // Create dummy input - actual Piper models need specific inputs
-    // This is a simplified version; users may need proper phonemization
-    let input_ids: Vec<i64> = text.chars().take(100).map(|c| c as i64).collect();
-    let input_tensor = Tensor::from_array(([1, input_ids.len()], input_ids.as_slice()))
-        .map_err(|e| e.to_string())?;
-    
-    let outputs = sess.run(ort::inputs![input_tensor])
-        .map_err(|e| e.to_string())?;
-    
-    // Try to extract audio
-    if let Some(out) = outputs.get("output") {
-        // This is model-dependent; simplified
-        let _ = out;
+pub async fn speak_local(app: AppHandle, text: String) -> Result<String, String> {
+    let trimmed = text.trim().to_string();
+    if trimmed.is_empty() {
+        return Ok(String::new());
     }
-    
-    // Fallback: generate silence/wav header as placeholder if inference complex
-    // For now return empty base64 and let frontend fallback to WebSpeech
-    let spec = WavSpec {
-        channels: 1,
-        sample_rate: 22050,
-        bits_per_sample: 16,
-        sample_format: hound::SampleFormat::Int,
-    };
-    let mut cursor = Cursor::new(Vec::new());
-    {
-        let mut writer = WavWriter::new(&mut cursor, spec).map_err(|e| e.to_string())?;
-        // write a short silence
-        for _ in 0..1000 {
-            writer.write_sample(0i16).map_err(|e| e.to_string())?;
-        }
-        writer.finalize().map_err(|e| e.to_string())?;
-    }
-    let b64 = general_purpose::STANDARD.encode(cursor.into_inner());
-    Ok(format!("data:audio/wav;base64,{}", b64))
+    tokio::task::spawn_blocking(move || synth(&app, &trimmed))
+        .await
+        .map_err(|e| e.to_string())?
+}
+
+/// True when a Piper voice and runtime are present. Used by the UI to decide
+/// whether to offer the local voice.
+#[tauri::command]
+pub fn tts_available(app: AppHandle) -> bool {
+    available(&app)
+}
+
+#[allow(dead_code)]
+fn is_voice_file(path: &Path) -> bool {
+    path.extension()
+        .and_then(|e| e.to_str())
+        .map(|e| e.eq_ignore_ascii_case("onnx"))
+        .unwrap_or(false)
 }

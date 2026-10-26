@@ -9,7 +9,7 @@ import { groupOutfits, mergeOutfits, DEFAULT_OUTFIT } from "./outfits";
 import type { AppConfig, Rect } from "./types";
 import { Voice } from "./voice";
 import { tts, isMuted } from "./tts";
-import { addMemory, getTimeGreeting, checkBattery } from "./memory";
+import { addMemory, initMemory, hasMemory, detectUserName, detectFacts, rememberFact, recallUserName, getMemory, getTimeGreeting, checkBattery, flushMemory } from "./memory";
 
 const POLL_INTERVAL = 40;
 /** How often the silhouette is handed over to the native hit test (ms). */
@@ -39,6 +39,20 @@ function pick<T>(items: T[]): T {
 export async function bootstrap(): Promise<void> {
   const config: AppConfig = await api.getConfig();
   log("boot: config loaded", config);
+
+  // The memory has to be ready before the Chat is constructed, because the
+  // saved conversation is seeded into her history there.
+  await initMemory();
+
+  // A name from an earlier session is recovered from the memory, so the first
+  // greeting already uses it even if the config was never updated back then.
+  if (!config.userName || config.userName === "you") {
+    const remembered = recallUserName();
+    if (remembered) {
+      config.userName = remembered;
+      void api.setConfig(config);
+    }
+  }
 
   const stageEl = document.getElementById("stage") as HTMLDivElement;
   const bubbleEl = document.getElementById("bubble") as HTMLDivElement;
@@ -322,12 +336,32 @@ export async function bootstrap(): Promise<void> {
     }, backendOnline ? 30_000 : 4_000);
   }
 
+  let chatRestored = false;
+  function restoreChatLog(): void {
+    if (chatRestored) return;
+    chatRestored = true;
+    const past = getMemory()
+      .filter((entry) => entry.role !== "system" && entry.content.trim())
+      .slice(-6);
+    if (past.length === 0) return;
+    const divider = document.createElement("div");
+    divider.className = "msg system";
+    divider.textContent = "~ earlier ~";
+    chatLog.appendChild(divider);
+    for (const entry of past) {
+      const text =
+        entry.role === "user" ? entry.content : extractEmotionTag(entry.content).text;
+      logMessage(text, entry.role === "user" ? "user" : "her");
+    }
+  }
+
   function toggleChat(force?: boolean): void {
     const show = force ?? chatEl.hidden;
     chatEl.hidden = !show;
     log(`chat panel ${show ? "opened" : "closed"}`);
     if (show) {
       bubbleEl.hidden = true;
+      restoreChatLog();
       layoutChat();
       chatInput.focus();
       // The server may have come up (or died) since the last probe.
@@ -461,6 +495,7 @@ export async function bootstrap(): Promise<void> {
         showBubble(display, Math.max(4, config.bubbleSeconds));
         try {
           addMemory({ role: "assistant", content: display });
+          void flushMemory();
         } catch {}
         // Speak with TTS and lip-sync
         tts.speak(full, {
@@ -497,9 +532,25 @@ export async function bootstrap(): Promise<void> {
     if (!text.trim()) return;
     chatInput.value = "";
     logMessage(text, "user");
-    try {
-      addMemory({ role: "user", content: text });
-    } catch {}
+
+    // Remember the name if the user introduces themselves, so a later session
+    // greets them properly even before the model is asked anything.
+    const name = detectUserName(text);
+    if (name && name !== config.userName) {
+      config.userName = name;
+      void api.setConfig(config);
+      chatName.textContent = config.personaName || "Companion";
+      rememberFact("name", name);
+    }
+
+    // Preferences such as a favourite colour are stored as tidy facts, so a
+    // corrected answer replaces the old one instead of piling up in history.
+    for (const fact of detectFacts(text)) {
+      rememberFact(fact.label, fact.value);
+    }
+
+    addMemory({ role: "user", content: text });
+    void flushMemory();
     void chat.send(text);
   });
 
@@ -511,6 +562,10 @@ export async function bootstrap(): Promise<void> {
   });
   await listen<string>("menu:open-config", (event) => {
     void api.openPath(event.payload);
+  });
+  // The bundled llama-server reports loading progress while it warms up.
+  await listen<string>("chat:status", (event) => {
+    setChatStatus(event.payload);
   });
 
   // ---------------------------------------------------------------- menu
@@ -1191,12 +1246,17 @@ export async function bootstrap(): Promise<void> {
   await refreshBackend(true);
   watchBackend();
 
-  // Time-aware greetings
+  // Time-aware greetings. When there is saved history she says so, which is
+  // the visible proof that she remembers the last session.
   try {
     const tg = getTimeGreeting();
     if (tg) {
-      chat.say(tg);
-      showBubble(tg);
+      const name = config.userName ? `, ${config.userName}` : "";
+      const line = hasMemory()
+        ? `Welcome back${name}~ ${tg}`
+        : `${tg}`;
+      chat.say(line);
+      showBubble(line);
     } else if (config.greetOnStart) {
       const line = pick(GREETINGS);
       chat.say(line);
